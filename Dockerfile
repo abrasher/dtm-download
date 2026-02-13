@@ -7,7 +7,7 @@ COPY public ./public
 COPY src ./src
 RUN npm run build
 
-FROM rust:1.85-bookworm AS backend-build
+FROM rust:bookworm AS backend-build
 WORKDIR /app/src-server
 COPY src-server/Cargo.toml src-server/Cargo.lock ./
 COPY src-server/src ./src

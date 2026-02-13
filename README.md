@@ -55,7 +55,7 @@ http://localhost:3000
 ### Prerequisites
 
 - Node.js 20+
-- Rust 1.85+
+- Rust 1.88+
 - GDAL
 
 ### Run frontend + backend
