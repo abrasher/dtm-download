@@ -75,18 +75,16 @@ pub async fn start_download(
     Json(req): Json<DownloadRequest>,
 ) -> Result<Json<DownloadStartResponse>, String> {
     let download_id = uuid::Uuid::new_v4().to_string();
-    let work_dir = std::env::temp_dir()
-        .join("dtm-downloads")
-        .join(&download_id);
-    std::fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
     let cache_root = cache_root_dir();
     let zip_cache_dir = cache_root.join("zips");
     let extract_cache_dir = cache_root.join("extracts");
+    let output_dir = cache_root.join("outputs").join(&download_id);
     std::fs::create_dir_all(&zip_cache_dir).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&extract_cache_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&output_dir).map_err(|e| e.to_string())?;
 
     let output_filename = format!("dtm_output_{}.tif", &download_id[..8]);
-    let output_path = work_dir
+    let output_path = output_dir
         .join(&output_filename)
         .to_string_lossy()
         .to_string();
@@ -123,11 +121,14 @@ pub async fn start_download(
             output_path,
             clip_extent,
             compression,
-            tx,
+            tx.clone(),
         )
         .await
         {
             eprintln!("Download job error: {}", e);
+            let _ = tx.send(ProgressEvent::Error {
+                message: e.to_string(),
+            });
         }
     });
 
@@ -145,28 +146,64 @@ async fn run_download_job(
 ) -> Result<(), String> {
     let progress_sender = ProgressSender::new(sender.clone());
 
-    let manager = DownloadManager::new();
-    let mut all_tiff_files = Vec::new();
+    let manager = Arc::new(DownloadManager::new());
 
-    for pkg in &packages {
-        let cache_key = package_cache_key(pkg);
+    println!(
+        "[job] Starting download of {} package(s) -> zip_dir={} extract_dir={}",
+        packages.len(),
+        zip_cache_dir,
+        extract_cache_dir
+    );
+
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for pkg in packages {
+        let cache_key = package_cache_key(&pkg);
         let zip_path = format!("{}/{}.zip", zip_cache_dir, cache_key);
         let extract_dir = format!("{}/{}", extract_cache_dir, cache_key);
+        let manager = Arc::clone(&manager);
+        let progress_sender = progress_sender.clone();
 
-        manager
-            .download_with_progress(
-                &pkg.download_url,
-                &zip_path,
-                &pkg.package_name,
-                &progress_sender,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+        join_set.spawn(async move {
+            println!("[job] Downloading package '{}' -> {}", pkg.package_name, zip_path);
+            manager
+                .download_with_progress(
+                    &pkg.download_url,
+                    &zip_path,
+                    &pkg.package_name,
+                    &progress_sender,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("[job] Download complete: '{}'", pkg.package_name);
 
-        let tiff_files = extract_zip(&zip_path, &extract_dir, &pkg.package_name, &progress_sender)
-            .await
-            .map_err(|e| e.to_string())?;
+            println!("[job] Extracting '{}' -> {}", pkg.package_name, extract_dir);
+            let tiff_files =
+                extract_zip(&zip_path, &extract_dir, &pkg.package_name, &progress_sender)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            println!(
+                "[job] Extraction complete: '{}', found {} TIFF file(s)",
+                pkg.package_name,
+                tiff_files.len()
+            );
+            Ok::<Vec<String>, String>(tiff_files)
+        });
+    }
+
+    let mut all_tiff_files = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        let tiff_files = result.map_err(|e| e.to_string())??;
         all_tiff_files.extend(tiff_files);
+    }
+
+    println!(
+        "[job] Total TIFF files collected: {}. Starting merge -> {}",
+        all_tiff_files.len(),
+        output_path
+    );
+    for f in &all_tiff_files {
+        println!("[job]   input: {}", f);
     }
 
     let clip = clip_extent.map(|c| ClipExtent {
@@ -181,9 +218,14 @@ async fn run_download_job(
         .await
         .map_err(|e| e.to_string())?;
 
-    let _ = sender.send(ProgressEvent::Complete {
-        output_filename: "dtm_output.tif".to_string(),
-    });
+    println!("[job] Merge complete. Output: {}", output_path);
+
+    let output_filename = std::path::Path::new(&output_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "dtm_output.tif".to_string());
+
+    let _ = sender.send(ProgressEvent::Complete { output_filename });
 
     Ok(())
 }
