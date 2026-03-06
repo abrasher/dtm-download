@@ -59,14 +59,31 @@ impl DownloadManager {
         response.content_length()
     }
 
-    pub fn is_download_complete(zip_path: &str, expected_size: u64) -> bool {
-        if expected_size == 0 {
-            return false;
+    fn done_marker_path(zip_path: &str) -> String {
+        format!("{}.done", zip_path)
+    }
+
+    fn is_download_complete(zip_path: &str) -> bool {
+        let marker = Self::done_marker_path(zip_path);
+        if Path::new(&marker).exists() && Path::new(zip_path).exists() {
+            return true;
         }
-        match std::fs::metadata(zip_path) {
-            Ok(meta) => meta.len() == expected_size,
-            Err(_) => false,
+        // Backfill marker for zips that existed before marker logic was introduced
+        if let Ok(meta) = std::fs::metadata(zip_path) {
+            if meta.len() > 0 {
+                Self::mark_download_complete(zip_path);
+                return true;
+            }
         }
+        false
+    }
+
+    fn mark_download_complete(zip_path: &str) {
+        let _ = std::fs::write(Self::done_marker_path(zip_path), b"");
+    }
+
+    fn clear_download_marker(zip_path: &str) {
+        let _ = std::fs::remove_file(Self::done_marker_path(zip_path));
     }
 
     pub async fn download_with_progress(
@@ -81,13 +98,12 @@ impl DownloadManager {
                 .map_err(|e| DownloadError::DirectoryError(e.to_string()))?;
         }
 
-        let expected_size = self.get_expected_size(url).await.unwrap_or(0);
-
-        if Self::is_download_complete(output_path, expected_size) {
+        if Self::is_download_complete(output_path) {
+            let file_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
             sender.send(ProgressEvent::Download(DownloadProgressEvent {
                 package_name: package_name.to_string(),
-                bytes_downloaded: expected_size,
-                total_bytes: expected_size,
+                bytes_downloaded: file_size,
+                total_bytes: file_size,
                 percentage: 100.0,
                 speed_bps: 0.0,
                 eta_seconds: None,
@@ -96,14 +112,16 @@ impl DownloadManager {
             return Ok(());
         }
 
+        let expected_size = self.get_expected_size(url).await.unwrap_or(0);
         let partial_size = match std::fs::metadata(output_path) {
             Ok(meta) => meta.len(),
             Err(_) => 0,
         };
 
-        let supports_range = expected_size > 0 && partial_size > 0;
+        // Clear any stale marker (shouldn't exist, but be safe)
+        Self::clear_download_marker(output_path);
 
-        if supports_range && partial_size < expected_size {
+        let result = if expected_size > 0 && partial_size > 0 && partial_size < expected_size {
             self.download_resume(
                 url,
                 output_path,
@@ -119,7 +137,12 @@ impl DownloadManager {
             }
             self.download_fresh(url, output_path, package_name, sender)
                 .await
+        };
+
+        if result.is_ok() {
+            Self::mark_download_complete(output_path);
         }
+        result
     }
 
     async fn download_fresh(
@@ -466,7 +489,6 @@ mod tests {
 
     #[test]
     fn test_is_download_complete() {
-        assert!(!DownloadManager::is_download_complete("/nonexistent", 1000));
-        assert!(!DownloadManager::is_download_complete("/nonexistent", 0));
+        assert!(!DownloadManager::is_download_complete("/nonexistent"));
     }
 }

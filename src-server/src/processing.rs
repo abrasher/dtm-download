@@ -2,8 +2,8 @@ use crate::api_types::{ProcessingProgressEvent, ProgressEvent};
 use crate::download::ProgressSender;
 use serde_json::Value;
 use std::io;
-use std::process::Command;
 use thiserror::Error;
+use tokio::process::Command;
 
 #[derive(Debug, Error)]
 pub enum ProcessingError {
@@ -71,6 +71,7 @@ pub async fn merge_to_cog(
 
     let compress_opt = format!("COMPRESS={}", compression.to_gdal_string());
     let predictor_opt = detect_predictor_option(input_files.first().map(|s| s.as_str()))
+        .await
         .map(|p| format!("PREDICTOR={}", p));
     let temp_path = format!("{}.temp.tif", output_path.trim_end_matches(".tif"));
 
@@ -112,7 +113,7 @@ pub async fn merge_to_cog(
     }
     warp_cmd.arg(&temp_path);
 
-    let warp_output = warp_cmd.output()?;
+    let warp_output = warp_cmd.output().await?;
     if !warp_output.status.success() {
         let stderr = String::from_utf8_lossy(&warp_output.stderr);
         return Err(ProcessingError::GdalError(format!(
@@ -146,7 +147,8 @@ pub async fn merge_to_cog(
         .arg("BLOCKSIZE=512")
         .arg("-co")
         .arg("NUM_THREADS=ALL_CPUS")
-        .output()?;
+        .output()
+        .await?;
 
     if !translate_output.status.success() {
         let stderr = String::from_utf8_lossy(&translate_output.stderr);
@@ -167,17 +169,17 @@ pub async fn merge_to_cog(
     Ok(())
 }
 
-fn detect_predictor_option(input_file: Option<&str>) -> Option<u8> {
+async fn detect_predictor_option(input_file: Option<&str>) -> Option<u8> {
     let input_file = input_file?;
-    let data_type = detect_raster_data_type(input_file).ok()?;
+    let data_type = detect_raster_data_type(input_file).await.ok()?;
     if is_float_raster_type(&data_type) {
         return Some(3);
     }
     None
 }
 
-fn detect_raster_data_type(path: &str) -> Result<String, ProcessingError> {
-    let output = Command::new("gdalinfo").arg("-json").arg(path).output()?;
+async fn detect_raster_data_type(path: &str) -> Result<String, ProcessingError> {
+    let output = Command::new("gdalinfo").arg("-json").arg(path).output().await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -208,10 +210,11 @@ fn is_float_raster_type(data_type: &str) -> bool {
     matches!(data_type, "Float32" | "Float64" | "CFloat32" | "CFloat64")
 }
 
-pub fn check_gdal_available() -> Result<String, ProcessingError> {
+pub async fn check_gdal_available() -> Result<String, ProcessingError> {
     let output = Command::new("gdalinfo")
         .arg("--version")
         .output()
+        .await
         .map_err(|e| ProcessingError::GdalNotFound(e.to_string()))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
