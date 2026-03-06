@@ -323,6 +323,46 @@ pub struct ExtractedFiles {
     pub tiff_files: Vec<String>,
 }
 
+fn is_tiff_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            let ext = ext.to_ascii_lowercase();
+            ext == "tif" || ext == "tiff"
+        })
+        .unwrap_or(false)
+}
+
+fn collect_tiff_files(root: &Path) -> io::Result<Vec<String>> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut tiff_files = Vec::new();
+
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if is_tiff_path(&path) {
+                tiff_files.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    tiff_files.sort();
+    tiff_files.dedup();
+    Ok(tiff_files)
+}
+
+fn normalize_tiff_files(tiff_files: Vec<String>) -> Vec<String> {
+    let mut unique_files = tiff_files;
+    unique_files.sort();
+    unique_files.dedup();
+    unique_files
+}
+
 pub fn check_extraction_complete(zip_path: &str, output_dir: &str) -> Option<ExtractedFiles> {
     let file = File::open(zip_path).ok()?;
     let mut archive = ZipArchive::new(file).ok()?;
@@ -353,25 +393,30 @@ pub fn check_extraction_complete(zip_path: &str, output_dir: &str) -> Option<Ext
                     return None;
                 }
 
-                let ext = outpath.extension().map(|e| e.to_string_lossy().to_string());
-                Some((outpath.to_string_lossy().to_string(), ext))
+                Some(outpath)
             }
         };
 
-        if let Some((path, ext)) = result {
-            if let Some(e) = ext {
-                if e == "tif" || e == "tiff" {
-                    tiff_files.push(path);
-                }
+        if let Some(path) = result {
+            if is_tiff_path(&path) {
+                tiff_files.push(path.to_string_lossy().to_string());
             }
         }
     }
 
     if tiff_files.is_empty() {
-        return None;
+        let scanned_files = collect_tiff_files(Path::new(output_dir)).ok()?;
+        if scanned_files.is_empty() {
+            return None;
+        }
+        return Some(ExtractedFiles {
+            tiff_files: scanned_files,
+        });
     }
 
-    Some(ExtractedFiles { tiff_files })
+    Some(ExtractedFiles {
+        tiff_files: normalize_tiff_files(tiff_files),
+    })
 }
 
 pub async fn extract_zip(
@@ -444,10 +489,8 @@ pub async fn extract_zip(
                     io::copy(&mut file, &mut outfile)?;
                 }
 
-                if let Some(ext) = outpath.extension() {
-                    if ext == "tif" || ext == "tiff" {
-                        extracted_files.push(outpath.to_string_lossy().to_string());
-                    }
+                if is_tiff_path(&outpath) {
+                    extracted_files.push(outpath.to_string_lossy().to_string());
                 }
             }
         }
@@ -469,7 +512,13 @@ pub async fn extract_zip(
         }
     }
 
-    Ok(extracted_files)
+    let extracted_files = normalize_tiff_files(extracted_files);
+    if !extracted_files.is_empty() {
+        return Ok(extracted_files);
+    }
+
+    let scanned_files = collect_tiff_files(Path::new(output_dir))?;
+    Ok(scanned_files)
 }
 
 impl Default for DownloadManager {
@@ -481,6 +530,33 @@ impl Default for DownloadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use zip::write::SimpleFileOptions;
+
+    fn create_temp_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("{}-{}", prefix, unique));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_zip_with_entries(zip_path: &Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+
+        for (name, contents) in entries {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(contents).unwrap();
+        }
+
+        writer.finish().unwrap();
+    }
+
     #[test]
     fn test_download_manager_creation() {
         let manager = DownloadManager::new();
@@ -490,5 +566,64 @@ mod tests {
     #[test]
     fn test_is_download_complete() {
         assert!(!DownloadManager::is_download_complete("/nonexistent"));
+    }
+
+    #[test]
+    fn test_check_extraction_complete_detects_uppercase_tiff_files() {
+        let temp_dir = create_temp_dir("dtm-download-check-extract");
+        let zip_path = temp_dir.join("package.zip");
+        let output_dir = temp_dir.join("extract");
+
+        write_zip_with_entries(
+            &zip_path,
+            &[
+                ("nested/TILE_001.TIF", b"fake-tiff-data"),
+                ("nested/readme.txt", b"metadata"),
+            ],
+        );
+
+        let extracted_tiff = output_dir.join("nested").join("TILE_001.TIF");
+        std::fs::create_dir_all(extracted_tiff.parent().unwrap()).unwrap();
+        std::fs::write(&extracted_tiff, b"fake-tiff-data").unwrap();
+        std::fs::write(output_dir.join("nested").join("readme.txt"), b"metadata").unwrap();
+
+        let result =
+            check_extraction_complete(zip_path.to_str().unwrap(), output_dir.to_str().unwrap())
+                .unwrap();
+
+        assert_eq!(
+            result.tiff_files,
+            vec![extracted_tiff.to_string_lossy().to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_returns_uppercase_cached_tiffs() {
+        let temp_dir = create_temp_dir("dtm-download-extract-zip");
+        let zip_path = temp_dir.join("package.zip");
+        let output_dir = temp_dir.join("extract");
+
+        write_zip_with_entries(&zip_path, &[("tile/DTM_CACHE.TIF", b"cached-data")]);
+
+        let extracted_tiff = output_dir.join("tile").join("DTM_CACHE.TIF");
+        std::fs::create_dir_all(extracted_tiff.parent().unwrap()).unwrap();
+        std::fs::write(&extracted_tiff, b"cached-data").unwrap();
+
+        let (tx, _) = broadcast::channel(8);
+        let sender = ProgressSender::new(tx);
+        let result = extract_zip(
+            zip_path.to_str().unwrap(),
+            output_dir.to_str().unwrap(),
+            "Cached package",
+            &sender,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, vec![extracted_tiff.to_string_lossy().to_string()]);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
