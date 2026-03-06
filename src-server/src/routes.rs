@@ -89,7 +89,7 @@ pub async fn start_download(
         .to_string_lossy()
         .to_string();
 
-    let (tx, _) = broadcast::channel::<ProgressEvent>(64);
+    let (tx, _) = broadcast::channel::<ProgressEvent>(256);
 
     let job = DownloadJob {
         output_path: output_path.clone(),
@@ -165,7 +165,10 @@ async fn run_download_job(
         let progress_sender = progress_sender.clone();
 
         join_set.spawn(async move {
-            println!("[job] Downloading package '{}' -> {}", pkg.package_name, zip_path);
+            println!(
+                "[job] Downloading package '{}' -> {}",
+                pkg.package_name, zip_path
+            );
             manager
                 .download_with_progress(
                     &pkg.download_url,
@@ -295,7 +298,7 @@ pub async fn download_progress(
     let mut rx = sender.subscribe();
 
     let stream = async_stream::stream! {
-        while let Ok(event) = rx.recv().await {
+        while let Some(event) = recv_progress_event(&mut rx).await {
             let json = serde_json::to_string(&event).unwrap_or_default();
             yield Ok(Event::default().data(json));
         }
@@ -306,6 +309,16 @@ pub async fn download_progress(
             .interval(std::time::Duration::from_secs(15))
             .text("ping"),
     ))
+}
+
+async fn recv_progress_event(rx: &mut broadcast::Receiver<ProgressEvent>) -> Option<ProgressEvent> {
+    loop {
+        match rx.recv().await {
+            Ok(event) => return Some(event),
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+    }
 }
 
 pub async fn download_file(
@@ -345,6 +358,7 @@ pub async fn download_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::broadcast;
 
     fn test_package(package_name: &str, download_url: &str) -> Package {
         Package {
@@ -387,5 +401,42 @@ mod tests {
         } else {
             std::env::remove_var("DTM_CACHE_DIR");
         }
+    }
+
+    #[tokio::test]
+    async fn test_recv_progress_event_skips_lagged_messages() {
+        let (tx, mut rx) = broadcast::channel(1);
+
+        tx.send(ProgressEvent::Download(
+            crate::api_types::DownloadProgressEvent {
+                package_name: "first".to_string(),
+                bytes_downloaded: 1,
+                total_bytes: 10,
+                percentage: 10.0,
+                speed_bps: 0.0,
+                eta_seconds: None,
+                status: "downloading".to_string(),
+            },
+        ))
+        .unwrap();
+        tx.send(ProgressEvent::Complete {
+            output_filename: "latest.tif".to_string(),
+        })
+        .unwrap();
+
+        let event = recv_progress_event(&mut rx).await;
+        assert!(matches!(
+            event,
+            Some(ProgressEvent::Complete { output_filename }) if output_filename == "latest.tif"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_recv_progress_event_returns_none_when_channel_closed() {
+        let (tx, mut rx) = broadcast::channel(1);
+        drop(tx);
+
+        let event = recv_progress_event(&mut rx).await;
+        assert!(event.is_none());
     }
 }

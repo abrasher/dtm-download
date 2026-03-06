@@ -2,7 +2,9 @@ use crate::api_types::{ProcessingProgressEvent, ProgressEvent};
 use crate::download::ProgressSender;
 use serde_json::Value;
 use std::io;
+use std::process::Stdio;
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 #[derive(Debug, Error)]
@@ -63,23 +65,21 @@ pub async fn merge_to_cog(
         return Err(ProcessingError::NoInputFiles);
     }
 
-    sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
-        stage: "merging".to_string(),
-        percentage: 0,
-        message: "Starting merge process...".to_string(),
-    }));
-
     let compress_opt = format!("COMPRESS={}", compression.to_gdal_string());
     let predictor_opt = detect_predictor_option(input_files.first().map(|s| s.as_str()))
         .await
         .map(|p| format!("PREDICTOR={}", p));
     let temp_path = format!("{}.temp.tif", output_path.trim_end_matches(".tif"));
-
-    sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
-        stage: "merging".to_string(),
-        percentage: 10,
-        message: "Merging and clipping rasters...".to_string(),
-    }));
+    let warp_stage = if clip_extent.is_some() {
+        "clipping"
+    } else {
+        "merging"
+    };
+    let warp_message = if clip_extent.is_some() {
+        "Cropping rasters..."
+    } else {
+        "Merging rasters..."
+    };
 
     let mut warp_cmd = Command::new("gdalwarp");
     warp_cmd
@@ -112,51 +112,35 @@ pub async fn merge_to_cog(
         warp_cmd.arg(file);
     }
     warp_cmd.arg(&temp_path);
+    run_gdal_command_with_progress(warp_cmd, warp_stage, 0, 75, warp_message, sender).await?;
 
-    let warp_output = warp_cmd.output().await?;
-    if !warp_output.status.success() {
-        let stderr = String::from_utf8_lossy(&warp_output.stderr);
-        return Err(ProcessingError::GdalError(format!(
-            "gdalwarp failed: {}",
-            stderr
-        )));
-    }
-
-    sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
-        stage: "creating_cog".to_string(),
-        percentage: 60,
-        message: "Creating Cloud Optimized GeoTIFF...".to_string(),
-    }));
-
-    let translate_output = Command::new("gdal_translate")
+    let mut translate_cmd = Command::new("gdal_translate");
+    translate_cmd
         .arg(&temp_path)
         .arg(output_path)
         .arg("-of")
         .arg("COG")
         .arg("-co")
-        .arg(&compress_opt)
-        .args(
-            predictor_opt
-                .as_ref()
-                .map(|p| vec!["-co", p.as_str()])
-                .unwrap_or_default(),
-        )
+        .arg(&compress_opt);
+    if let Some(predictor) = &predictor_opt {
+        translate_cmd.arg("-co").arg(predictor);
+    }
+    translate_cmd
         .arg("-co")
         .arg("BIGTIFF=YES")
         .arg("-co")
         .arg("BLOCKSIZE=512")
         .arg("-co")
-        .arg("NUM_THREADS=ALL_CPUS")
-        .output()
-        .await?;
-
-    if !translate_output.status.success() {
-        let stderr = String::from_utf8_lossy(&translate_output.stderr);
-        return Err(ProcessingError::GdalError(format!(
-            "gdal_translate failed: {}",
-            stderr
-        )));
-    }
+        .arg("NUM_THREADS=ALL_CPUS");
+    run_gdal_command_with_progress(
+        translate_cmd,
+        "creating_cog",
+        75,
+        99,
+        "Creating Cloud Optimized GeoTIFF...",
+        sender,
+    )
+    .await?;
 
     let _ = std::fs::remove_file(&temp_path);
 
@@ -169,6 +153,160 @@ pub async fn merge_to_cog(
     Ok(())
 }
 
+async fn run_gdal_command_with_progress(
+    mut command: Command,
+    stage: &str,
+    start_percentage: u8,
+    end_percentage: u8,
+    message: &str,
+    sender: &ProgressSender,
+) -> Result<(), ProcessingError> {
+    sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
+        stage: stage.to_string(),
+        percentage: start_percentage,
+        message: message.to_string(),
+    }));
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = command.spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ProcessingError::GdalError("failed to capture GDAL stdout".to_string()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ProcessingError::GdalError("failed to capture GDAL stderr".to_string()))?;
+
+    let progress_sender = sender.clone();
+    let stage_name = stage.to_string();
+    let stage_message = message.to_string();
+
+    let stdout_task = tokio::spawn(async move {
+        let mut parser = GdalProgressParser::new();
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 256];
+
+        loop {
+            let read = stdout.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..read]);
+            for percent in parser.consume(&buffer[..read]) {
+                let percentage = scale_progress(percent, start_percentage, end_percentage);
+                progress_sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
+                    stage: stage_name.clone(),
+                    percentage,
+                    message: format!("{} {}%", stage_message, percent),
+                }));
+            }
+        }
+
+        Ok::<(Vec<u8>, u8), io::Error>((output, parser.last_percent()))
+    });
+
+    let stderr_task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).await?;
+        Ok::<Vec<u8>, io::Error>(output)
+    });
+
+    let status = child.wait().await?;
+    let (stdout_output, last_progress) = stdout_task
+        .await
+        .map_err(|e| ProcessingError::GdalError(e.to_string()))??;
+    let stderr_output = stderr_task
+        .await
+        .map_err(|e| ProcessingError::GdalError(e.to_string()))??;
+
+    if !status.success() {
+        let stderr_text = String::from_utf8_lossy(&stderr_output).trim().to_string();
+        let stdout_text = String::from_utf8_lossy(&stdout_output).trim().to_string();
+        let details = if !stderr_text.is_empty() {
+            stderr_text
+        } else if !stdout_text.is_empty() {
+            stdout_text
+        } else {
+            format!("{} exited with status {}", stage, status)
+        };
+        return Err(ProcessingError::GdalError(details));
+    }
+
+    if last_progress < 100 {
+        sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
+            stage: stage.to_string(),
+            percentage: end_percentage,
+            message: message.to_string(),
+        }));
+    }
+
+    Ok(())
+}
+
+fn scale_progress(progress: u8, start_percentage: u8, end_percentage: u8) -> u8 {
+    if end_percentage <= start_percentage {
+        return end_percentage;
+    }
+
+    let span = (end_percentage - start_percentage) as f64;
+    let scaled = start_percentage as f64 + (progress as f64 / 100.0) * span;
+    scaled.round().clamp(0.0, 100.0) as u8
+}
+
+#[derive(Default)]
+struct GdalProgressParser {
+    current_digits: String,
+    last_percent: u8,
+}
+
+impl GdalProgressParser {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn consume(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut parsed = Vec::new();
+
+        for byte in bytes {
+            let ch = *byte as char;
+            if ch.is_ascii_digit() {
+                self.current_digits.push(ch);
+                continue;
+            }
+
+            if let Some(percent) = self.finish_number() {
+                parsed.push(percent);
+            }
+        }
+
+        parsed
+    }
+
+    fn last_percent(&self) -> u8 {
+        self.last_percent
+    }
+
+    fn finish_number(&mut self) -> Option<u8> {
+        if self.current_digits.is_empty() {
+            return None;
+        }
+
+        let digits = std::mem::take(&mut self.current_digits);
+        let percent = digits.parse::<u8>().ok()?;
+        if percent > 100 || percent < self.last_percent {
+            return None;
+        }
+        if percent == self.last_percent {
+            return None;
+        }
+
+        self.last_percent = percent;
+        Some(percent)
+    }
+}
+
 async fn detect_predictor_option(input_file: Option<&str>) -> Option<u8> {
     let input_file = input_file?;
     let data_type = detect_raster_data_type(input_file).await.ok()?;
@@ -179,7 +317,11 @@ async fn detect_predictor_option(input_file: Option<&str>) -> Option<u8> {
 }
 
 async fn detect_raster_data_type(path: &str) -> Result<String, ProcessingError> {
-    let output = Command::new("gdalinfo").arg("-json").arg(path).output().await?;
+    let output = Command::new("gdalinfo")
+        .arg("-json")
+        .arg(path)
+        .output()
+        .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -249,5 +391,30 @@ mod tests {
         assert!(is_float_raster_type("Float32"));
         assert!(is_float_raster_type("Float64"));
         assert!(!is_float_raster_type("UInt16"));
+    }
+
+    #[test]
+    fn test_scale_progress() {
+        assert_eq!(scale_progress(0, 10, 90), 10);
+        assert_eq!(scale_progress(50, 10, 90), 50);
+        assert_eq!(scale_progress(100, 10, 90), 90);
+    }
+
+    #[test]
+    fn test_gdal_progress_parser_reads_chunked_progress() {
+        let mut parser = GdalProgressParser::new();
+        assert_eq!(parser.consume(b"0...10..."), vec![10]);
+        assert_eq!(parser.consume(b"20...3"), vec![20]);
+        assert_eq!(parser.consume(b"0...100 - done."), vec![30, 100]);
+        assert_eq!(parser.last_percent(), 100);
+    }
+
+    #[test]
+    fn test_gdal_progress_parser_ignores_duplicates_and_invalid_values() {
+        let mut parser = GdalProgressParser::new();
+        assert_eq!(parser.consume(b"0...0..."), Vec::<u8>::new());
+        assert_eq!(parser.consume(b"10..."), vec![10]);
+        assert_eq!(parser.consume(b"105...9..."), Vec::<u8>::new());
+        assert_eq!(parser.last_percent(), 10);
     }
 }
