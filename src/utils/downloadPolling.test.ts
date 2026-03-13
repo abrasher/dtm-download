@@ -57,6 +57,16 @@ describe('downloadPolling', () => {
     ).toContain('Cloud Optimized GeoTIFF');
   });
 
+  it('describes the temporary VRT build stage', () => {
+    expect(
+      getProcessingStageDescription({
+        stage: 'building_vrt',
+        percentage: 12,
+        message: 'Starting gdalbuildvrt. Building a virtual mosaic from the selected source rasters...',
+      }),
+    ).toContain('virtual mosaic');
+  });
+
   it('explains the handoff after gdalwarp finishes', () => {
     expect(
       getProcessingStageDescription({

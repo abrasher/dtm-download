@@ -488,6 +488,8 @@ function App() {
     switch (stage) {
       case 'preparing_inputs':
         return 'Preparing Inputs';
+      case 'building_vrt':
+        return 'Building VRT';
       case 'clipping':
         return 'Clipping Area';
       case 'merging':

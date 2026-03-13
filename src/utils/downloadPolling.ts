@@ -49,6 +49,14 @@ export function getProcessingStageDescription(progress: ProcessingProgress | nul
   switch (progress.stage) {
     case 'preparing_inputs':
       return 'Preparing source rasters before clipping and packaging.';
+    case 'building_vrt':
+      if (progress.message.includes('gdalbuildvrt finished')) {
+        return 'The virtual mosaic is ready. Final raster assembly is starting now.';
+      }
+      if (progress.message.includes('Starting gdalbuildvrt')) {
+        return 'Building a virtual mosaic from only the tiles that intersect your selected area.';
+      }
+      return 'Assembling a temporary virtual mosaic from the selected source tiles.';
     case 'clipping':
       if (progress.message.includes('gdalwarp finished')) {
         return 'Clipping is complete. The server is handing the intermediate raster off to Cloud Optimized GeoTIFF creation.';

@@ -1,5 +1,6 @@
 use crate::api_types::{ProcessingProgressEvent, ProgressEvent};
 use crate::download::ProgressSender;
+use futures::stream::{self, StreamExt};
 use serde_json::Value;
 use std::io;
 use std::process::Stdio;
@@ -17,6 +18,8 @@ pub enum ProcessingError {
     GdalError(String),
     #[error("No input files provided")]
     NoInputFiles,
+    #[error("No source rasters intersect the selected area")]
+    NoIntersectingInputFiles,
     #[error("IO error: {0}")]
     IoError(#[from] io::Error),
 }
@@ -56,6 +59,23 @@ pub struct ClipExtent {
     pub max_y: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RasterBounds {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+}
+
+impl ClipExtent {
+    fn intersects(&self, bounds: RasterBounds) -> bool {
+        self.min_x <= bounds.max_x
+            && self.max_x >= bounds.min_x
+            && self.min_y <= bounds.max_y
+            && self.max_y >= bounds.min_y
+    }
+}
+
 pub async fn merge_to_cog(
     input_files: &[String],
     output_path: &str,
@@ -67,10 +87,21 @@ pub async fn merge_to_cog(
         return Err(ProcessingError::NoInputFiles);
     }
 
+    let selected_input_files = if let Some(extent) = clip_extent {
+        filter_input_files_by_extent(input_files, extent, sender).await?
+    } else {
+        input_files.to_vec()
+    };
+
+    if selected_input_files.is_empty() {
+        return Err(ProcessingError::NoIntersectingInputFiles);
+    }
+
     let compress_opt = format!("COMPRESS={}", compression.to_gdal_string());
-    let predictor_opt = detect_predictor_option(input_files.first().map(|s| s.as_str()))
+    let predictor_opt = detect_predictor_option(selected_input_files.first().map(|s| s.as_str()))
         .await
         .map(|p| format!("PREDICTOR={}", p));
+    let vrt_path = format!("{}.selected.vrt", output_path.trim_end_matches(".tif"));
     let temp_path = format!("{}.temp.tif", output_path.trim_end_matches(".tif"));
 
     sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
@@ -78,7 +109,7 @@ pub async fn merge_to_cog(
         percentage: 5,
         message: format!(
             "Preparing {} raster(s) for processing...",
-            input_files.len()
+            selected_input_files.len()
         ),
     }));
 
@@ -92,6 +123,27 @@ pub async fn merge_to_cog(
     } else {
         "Merging source rasters..."
     };
+
+    let mut vrt_cmd = Command::new("gdalbuildvrt");
+    vrt_cmd
+        .arg("-overwrite")
+        .arg("-write_absolute_path")
+        .arg(&vrt_path);
+    for file in &selected_input_files {
+        vrt_cmd.arg(file);
+    }
+    run_gdal_command_with_progress(
+        vrt_cmd,
+        "gdalbuildvrt",
+        "building_vrt",
+        10,
+        14,
+        "Building a virtual mosaic from the selected source rasters...",
+        "gdalbuildvrt finished. Starting the final raster assembly...",
+        Some(&vrt_path),
+        sender,
+    )
+    .await?;
 
     let mut warp_cmd = Command::new("gdalwarp");
     warp_cmd
@@ -120,15 +172,12 @@ pub async fn merge_to_cog(
             .arg("EPSG:3857");
     }
 
-    for file in input_files {
-        warp_cmd.arg(file);
-    }
-    warp_cmd.arg(&temp_path);
+    warp_cmd.arg(&vrt_path).arg(&temp_path);
     run_gdal_command_with_progress(
         warp_cmd,
         "gdalwarp",
         warp_stage,
-        10,
+        15,
         74,
         warp_message,
         "gdalwarp finished. Preparing intermediate raster for Cloud Optimized GeoTIFF creation...",
@@ -175,6 +224,7 @@ pub async fn merge_to_cog(
     }));
 
     let _ = std::fs::remove_file(&temp_path);
+    let _ = std::fs::remove_file(&vrt_path);
 
     sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
         stage: "completed".to_string(),
@@ -183,6 +233,84 @@ pub async fn merge_to_cog(
     }));
 
     Ok(())
+}
+
+async fn filter_input_files_by_extent(
+    input_files: &[String],
+    clip_extent: ClipExtent,
+    sender: &ProgressSender,
+) -> Result<Vec<String>, ProcessingError> {
+    let total = input_files.len();
+    sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
+        stage: "preparing_inputs".to_string(),
+        percentage: 5,
+        message: format!(
+            "Inspecting {} raster(s) to match the selected area...",
+            total
+        ),
+    }));
+
+    let mut pending = stream::iter(input_files.iter().cloned().enumerate().map(
+        |(index, path)| async move {
+            let bounds = detect_raster_bounds(&path).await?;
+            Ok::<(usize, String, RasterBounds), ProcessingError>((index, path, bounds))
+        },
+    ))
+    .buffer_unordered(8);
+
+    let mut processed = 0usize;
+    let mut candidates = Vec::with_capacity(total);
+
+    while let Some(result) = pending.next().await {
+        let (index, path, bounds) = result?;
+        processed += 1;
+        candidates.push((index, path, bounds));
+
+        if processed == total || processed % 25 == 0 {
+            let percentage = 5 + ((processed as f64 / total as f64) * 4.0).round() as u8;
+            sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
+                stage: "preparing_inputs".to_string(),
+                percentage: percentage.min(9),
+                message: format!(
+                    "Checked {} of {} raster bounds for intersection...",
+                    processed, total
+                ),
+            }));
+        }
+    }
+
+    let selected_input_files = select_intersecting_input_files(candidates, clip_extent);
+    println!(
+        "[processing] input filter kept {} of {} raster(s) for the selected area",
+        selected_input_files.len(),
+        total
+    );
+    for file in &selected_input_files {
+        println!("[processing]   selected input: {}", file);
+    }
+
+    sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
+        stage: "preparing_inputs".to_string(),
+        percentage: 9,
+        message: format!(
+            "Selected {} of {} raster(s) that intersect the requested area.",
+            selected_input_files.len(),
+            total
+        ),
+    }));
+
+    Ok(selected_input_files)
+}
+
+fn select_intersecting_input_files(
+    mut candidates: Vec<(usize, String, RasterBounds)>,
+    clip_extent: ClipExtent,
+) -> Vec<String> {
+    candidates.sort_by_key(|(index, _, _)| *index);
+    candidates
+        .into_iter()
+        .filter_map(|(_, path, bounds)| clip_extent.intersects(bounds).then_some(path))
+        .collect()
 }
 
 async fn run_gdal_command_with_progress(
@@ -564,6 +692,30 @@ async fn detect_raster_data_type(path: &str) -> Result<String, ProcessingError> 
     })
 }
 
+async fn detect_raster_bounds(path: &str) -> Result<RasterBounds, ProcessingError> {
+    let output = Command::new("gdalinfo")
+        .arg("-json")
+        .arg(path)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ProcessingError::GdalError(format!(
+            "gdalinfo failed for {}: {}",
+            path, stderr
+        )));
+    }
+
+    let json_text = String::from_utf8_lossy(&output.stdout);
+    parse_raster_bounds(&json_text).ok_or_else(|| {
+        ProcessingError::GdalError(format!(
+            "gdalinfo output missing raster bounds for {}",
+            path
+        ))
+    })
+}
+
 fn parse_band_data_type(gdalinfo_json: &str) -> Option<String> {
     let value: Value = serde_json::from_str(gdalinfo_json).ok()?;
     value
@@ -573,6 +725,33 @@ fn parse_band_data_type(gdalinfo_json: &str) -> Option<String> {
         .get("type")?
         .as_str()
         .map(|s| s.to_string())
+}
+
+fn parse_raster_bounds(gdalinfo_json: &str) -> Option<RasterBounds> {
+    let value: Value = serde_json::from_str(gdalinfo_json).ok()?;
+    let corners = value.get("cornerCoordinates")?;
+    let mut xs = Vec::with_capacity(4);
+    let mut ys = Vec::with_capacity(4);
+
+    for key in ["upperLeft", "lowerLeft", "lowerRight", "upperRight"] {
+        let (x, y) = parse_coordinate_pair(corners.get(key)?)?;
+        xs.push(x);
+        ys.push(y);
+    }
+
+    Some(RasterBounds {
+        min_x: xs.iter().copied().fold(f64::INFINITY, f64::min),
+        min_y: ys.iter().copied().fold(f64::INFINITY, f64::min),
+        max_x: xs.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        max_y: ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    })
+}
+
+fn parse_coordinate_pair(value: &Value) -> Option<(f64, f64)> {
+    let coords = value.as_array()?;
+    let x = coords.first()?.as_f64()?;
+    let y = coords.get(1)?.as_f64()?;
+    Some((x, y))
 }
 
 fn is_float_raster_type(data_type: &str) -> bool {
@@ -611,6 +790,104 @@ mod tests {
     fn test_parse_band_data_type_missing() {
         let json = r#"{"bands":[]}"#;
         assert_eq!(parse_band_data_type(json), None);
+    }
+
+    #[test]
+    fn test_parse_raster_bounds() {
+        let json = r#"{
+            "cornerCoordinates": {
+                "upperLeft": [100.0, 500.0],
+                "lowerLeft": [100.0, 200.0],
+                "lowerRight": [300.0, 200.0],
+                "upperRight": [300.0, 500.0]
+            }
+        }"#;
+        assert_eq!(
+            parse_raster_bounds(json),
+            Some(RasterBounds {
+                min_x: 100.0,
+                min_y: 200.0,
+                max_x: 300.0,
+                max_y: 500.0,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_raster_bounds_missing_corner_coordinates() {
+        let json = r#"{"cornerCoordinates":{"upperLeft":[0.0, 1.0]}}"#;
+        assert_eq!(parse_raster_bounds(json), None);
+    }
+
+    #[test]
+    fn test_clip_extent_intersects_raster_bounds() {
+        let clip_extent = ClipExtent {
+            min_x: 100.0,
+            min_y: 100.0,
+            max_x: 200.0,
+            max_y: 200.0,
+        };
+        assert!(clip_extent.intersects(RasterBounds {
+            min_x: 150.0,
+            min_y: 150.0,
+            max_x: 250.0,
+            max_y: 250.0,
+        }));
+        assert!(!clip_extent.intersects(RasterBounds {
+            min_x: 201.0,
+            min_y: 201.0,
+            max_x: 300.0,
+            max_y: 300.0,
+        }));
+    }
+
+    #[test]
+    fn test_select_intersecting_input_files_preserves_original_order() {
+        let selected = select_intersecting_input_files(
+            vec![
+                (
+                    2,
+                    "tile-c.tif".to_string(),
+                    RasterBounds {
+                        min_x: 500.0,
+                        min_y: 500.0,
+                        max_x: 600.0,
+                        max_y: 600.0,
+                    },
+                ),
+                (
+                    0,
+                    "tile-a.tif".to_string(),
+                    RasterBounds {
+                        min_x: 0.0,
+                        min_y: 0.0,
+                        max_x: 100.0,
+                        max_y: 100.0,
+                    },
+                ),
+                (
+                    1,
+                    "tile-b.tif".to_string(),
+                    RasterBounds {
+                        min_x: 90.0,
+                        min_y: 90.0,
+                        max_x: 180.0,
+                        max_y: 180.0,
+                    },
+                ),
+            ],
+            ClipExtent {
+                min_x: 50.0,
+                min_y: 50.0,
+                max_x: 150.0,
+                max_y: 150.0,
+            },
+        );
+
+        assert_eq!(
+            selected,
+            vec!["tile-a.tif".to_string(), "tile-b.tif".to_string()]
+        );
     }
 
     #[test]

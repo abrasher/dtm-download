@@ -65,7 +65,7 @@ export interface DownloadProgress {
 }
 
 export interface ProcessingProgress {
-  stage: 'merging' | 'clipping' | 'compressing' | 'writing_cog' | 'completed' | 'error';
+  stage: 'preparing_inputs' | 'building_vrt' | 'merging' | 'clipping' | 'creating_cog' | 'finalizing' | 'completed' | 'error';
   percentage: number;
   message: string;
   error?: string;
