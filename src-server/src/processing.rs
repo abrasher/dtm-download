@@ -138,10 +138,7 @@ pub async fn merge_to_cog(
     };
 
     let mut vrt_cmd = Command::new("gdalbuildvrt");
-    vrt_cmd
-        .arg("-overwrite")
-        .arg("-write_absolute_path")
-        .arg(&vrt_path);
+    vrt_cmd.arg("-overwrite").arg(&vrt_path);
     for file in &selected_input_files {
         vrt_cmd.arg(file);
     }
