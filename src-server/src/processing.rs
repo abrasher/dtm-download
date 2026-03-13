@@ -3,8 +3,10 @@ use crate::download::ProgressSender;
 use serde_json::Value;
 use std::io;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 #[derive(Debug, Error)]
@@ -130,6 +132,7 @@ pub async fn merge_to_cog(
         74,
         warp_message,
         "gdalwarp finished. Preparing intermediate raster for Cloud Optimized GeoTIFF creation...",
+        Some(&temp_path),
         sender,
     )
     .await?;
@@ -160,6 +163,7 @@ pub async fn merge_to_cog(
         97,
         "Creating Cloud Optimized GeoTIFF...",
         "gdal_translate finished. Finalizing Cloud Optimized GeoTIFF output...",
+        Some(output_path),
         sender,
     )
     .await?;
@@ -189,11 +193,17 @@ async fn run_gdal_command_with_progress(
     end_percentage: u8,
     message: &str,
     completion_message: &str,
+    monitored_output_path: Option<&str>,
     sender: &ProgressSender,
 ) -> Result<(), ProcessingError> {
     println!(
         "[processing] starting {} for stage '{}' ({})",
         command_name, stage, message
+    );
+    println!(
+        "[processing] command for stage '{}': {}",
+        stage,
+        format_command_line(&command)
     );
     sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
         stage: stage.to_string(),
@@ -204,56 +214,57 @@ async fn run_gdal_command_with_progress(
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = command.spawn()?;
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| ProcessingError::GdalError("failed to capture GDAL stdout".to_string()))?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| ProcessingError::GdalError("failed to capture GDAL stderr".to_string()))?;
 
-    let progress_sender = sender.clone();
-    let stage_name = stage.to_string();
-    let stage_message = message.to_string();
-
-    let stdout_task = tokio::spawn(async move {
-        let mut parser = GdalProgressParser::new();
-        let mut output = Vec::new();
-        let mut buffer = [0_u8; 256];
-
-        loop {
-            let read = stdout.read(&mut buffer).await?;
-            if read == 0 {
-                break;
-            }
-            output.extend_from_slice(&buffer[..read]);
-            for percent in parser.consume(&buffer[..read]) {
-                let percentage = scale_progress(percent, start_percentage, end_percentage);
-                progress_sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
-                    stage: stage_name.clone(),
-                    percentage,
-                    message: format!("{} {}%", stage_message, percent),
-                }));
-            }
-        }
-
-        Ok::<(Vec<u8>, u8), io::Error>((output, parser.last_percent()))
-    });
-
-    let stderr_task = tokio::spawn(async move {
-        let mut output = Vec::new();
-        stderr.read_to_end(&mut output).await?;
-        Ok::<Vec<u8>, io::Error>(output)
+    let progress_parser = Arc::new(Mutex::new(GdalProgressParser::new()));
+    let stdout_task = tokio::spawn(read_gdal_stream(
+        stdout,
+        command_name.to_string(),
+        "stdout".to_string(),
+        stage.to_string(),
+        start_percentage,
+        end_percentage,
+        message.to_string(),
+        sender.clone(),
+        Arc::clone(&progress_parser),
+    ));
+    let stderr_task = tokio::spawn(read_gdal_stream(
+        stderr,
+        command_name.to_string(),
+        "stderr".to_string(),
+        stage.to_string(),
+        start_percentage,
+        end_percentage,
+        message.to_string(),
+        sender.clone(),
+        Arc::clone(&progress_parser),
+    ));
+    let heartbeat_task = monitored_output_path.map(|path| {
+        tokio::spawn(log_processing_heartbeat(
+            command_name.to_string(),
+            stage.to_string(),
+            path.to_string(),
+        ))
     });
 
     let status = child.wait().await?;
-    let (stdout_output, _last_progress) = stdout_task
+    let stdout_output = stdout_task
         .await
         .map_err(|e| ProcessingError::GdalError(e.to_string()))??;
     let stderr_output = stderr_task
         .await
         .map_err(|e| ProcessingError::GdalError(e.to_string()))??;
+    if let Some(task) = heartbeat_task {
+        task.abort();
+        let _ = task.await;
+    }
 
     if !status.success() {
         let stderr_text = String::from_utf8_lossy(&stderr_output).trim().to_string();
@@ -268,7 +279,10 @@ async fn run_gdal_command_with_progress(
         return Err(ProcessingError::GdalError(details));
     }
 
-    println!("[processing] {} finished for stage '{}'", command_name, stage);
+    println!(
+        "[processing] {} finished for stage '{}'",
+        command_name, stage
+    );
 
     sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
         stage: stage.to_string(),
@@ -277,6 +291,87 @@ async fn run_gdal_command_with_progress(
     }));
 
     Ok(())
+}
+
+async fn read_gdal_stream<R>(
+    mut reader: R,
+    command_name: String,
+    stream_name: String,
+    stage: String,
+    start_percentage: u8,
+    end_percentage: u8,
+    message: String,
+    sender: ProgressSender,
+    progress_parser: Arc<Mutex<GdalProgressParser>>,
+) -> Result<Vec<u8>, io::Error>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 256];
+    let mut log_buffer = StreamLogBuffer::default();
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+
+        let chunk = &buffer[..read];
+        output.extend_from_slice(chunk);
+
+        let text = String::from_utf8_lossy(chunk);
+        if looks_like_progress_fragment(&text) {
+            let percents = {
+                let mut parser = progress_parser
+                    .lock()
+                    .map_err(|_| io::Error::other("failed to lock GDAL progress parser"))?;
+                parser.consume(chunk)
+            };
+            for percent in percents {
+                let percentage = scale_progress(percent, start_percentage, end_percentage);
+                sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
+                    stage: stage.clone(),
+                    percentage,
+                    message: format!("{} {}%", message, percent),
+                }));
+            }
+        }
+
+        for line in log_buffer.push(&text) {
+            if let Some(line) = normalize_log_line(&line) {
+                println!("[processing] {} {}: {}", command_name, stream_name, line);
+            }
+        }
+    }
+
+    if let Some(line) = log_buffer
+        .finish()
+        .and_then(|line| normalize_log_line(&line))
+    {
+        println!("[processing] {} {}: {}", command_name, stream_name, line);
+    }
+
+    Ok(output)
+}
+
+async fn log_processing_heartbeat(
+    command_name: String,
+    stage: String,
+    monitored_output_path: String,
+) {
+    let started_at = Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let output_status = describe_output_file(&monitored_output_path);
+        println!(
+            "[processing] {} heartbeat for stage '{}': elapsed={}s, output={}",
+            command_name,
+            stage,
+            started_at.elapsed().as_secs(),
+            output_status
+        );
+    }
 }
 
 fn build_command_start_message(command_name: &str, message: &str) -> String {
@@ -297,6 +392,11 @@ fn scale_progress(progress: u8, start_percentage: u8, end_percentage: u8) -> u8 
 struct GdalProgressParser {
     current_digits: String,
     last_percent: u8,
+}
+
+#[derive(Default)]
+struct StreamLogBuffer {
+    pending: String,
 }
 
 impl GdalProgressParser {
@@ -322,10 +422,6 @@ impl GdalProgressParser {
         parsed
     }
 
-    fn last_percent(&self) -> u8 {
-        self.last_percent
-    }
-
     fn finish_number(&mut self) -> Option<u8> {
         if self.current_digits.is_empty() {
             return None;
@@ -342,6 +438,99 @@ impl GdalProgressParser {
 
         self.last_percent = percent;
         Some(percent)
+    }
+}
+
+impl StreamLogBuffer {
+    fn push(&mut self, text: &str) -> Vec<String> {
+        self.pending.push_str(text);
+
+        let mut completed = Vec::new();
+        let mut segment_start = 0;
+        for (index, ch) in self.pending.char_indices() {
+            if ch == '\n' || ch == '\r' {
+                completed.push(self.pending[segment_start..index].to_string());
+                segment_start = index + ch.len_utf8();
+            }
+        }
+
+        self.pending = self.pending[segment_start..].to_string();
+        completed
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        let remaining = self.pending.trim();
+        if remaining.is_empty() {
+            self.pending.clear();
+            return None;
+        }
+        let line = remaining.to_string();
+        self.pending.clear();
+        Some(line)
+    }
+}
+
+fn format_command_line(command: &Command) -> String {
+    let command = command.as_std();
+    let mut parts = Vec::new();
+    parts.push(shell_escape_arg(&command.get_program().to_string_lossy()));
+    parts.extend(
+        command
+            .get_args()
+            .map(|arg| shell_escape_arg(&arg.to_string_lossy())),
+    );
+    parts.join(" ")
+}
+
+fn shell_escape_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    if arg
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | '=' | ':'))
+    {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+fn looks_like_progress_fragment(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | '%' | ' '))
+}
+
+fn normalize_log_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || looks_like_progress_fragment(trimmed) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn describe_output_file(path: &str) -> String {
+    match std::fs::metadata(path) {
+        Ok(metadata) => format!("{} ({})", path, format_byte_count(metadata.len())),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => format!("{} (not created yet)", path),
+        Err(err) => format!("{} (stat failed: {})", path, err),
+    }
+}
+
+fn format_byte_count(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
     }
 }
 
@@ -452,7 +641,7 @@ mod tests {
         assert_eq!(parser.consume(b"0...10..."), vec![10]);
         assert_eq!(parser.consume(b"20...3"), vec![20]);
         assert_eq!(parser.consume(b"0...100 - done."), vec![30, 100]);
-        assert_eq!(parser.last_percent(), 100);
+        assert_eq!(parser.last_percent, 100);
     }
 
     #[test]
@@ -461,6 +650,40 @@ mod tests {
         assert_eq!(parser.consume(b"0...0..."), Vec::<u8>::new());
         assert_eq!(parser.consume(b"10..."), vec![10]);
         assert_eq!(parser.consume(b"105...9..."), Vec::<u8>::new());
-        assert_eq!(parser.last_percent(), 10);
+        assert_eq!(parser.last_percent, 10);
+    }
+
+    #[test]
+    fn test_stream_log_buffer_splits_newlines_and_carriage_returns() {
+        let mut buffer = StreamLogBuffer::default();
+        assert_eq!(
+            buffer.push("line one\nline two\rline"),
+            vec!["line one".to_string(), "line two".to_string()]
+        );
+        assert_eq!(buffer.finish(), Some("line".to_string()));
+    }
+
+    #[test]
+    fn test_looks_like_progress_fragment() {
+        assert!(looks_like_progress_fragment("0...10...20..."));
+        assert!(looks_like_progress_fragment(" 30...40... "));
+        assert!(!looks_like_progress_fragment(
+            "Warning 1: something happened"
+        ));
+    }
+
+    #[test]
+    fn test_normalize_log_line_filters_progress_only_lines() {
+        assert_eq!(normalize_log_line("0...10..."), None);
+        assert_eq!(
+            normalize_log_line("Warning 1: source has nodata"),
+            Some("Warning 1: source has nodata".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_byte_count() {
+        assert_eq!(format_byte_count(999), "999 B");
+        assert_eq!(format_byte_count(2048), "2.00 KB");
     }
 }
