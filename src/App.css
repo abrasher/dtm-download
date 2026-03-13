@@ -366,6 +366,21 @@
   margin-top: 0.25rem;
 }
 
+.processing-stage-description,
+.processing-stage-note {
+  font-size: 0.8rem;
+  line-height: 1.4;
+  margin-top: 0.6rem;
+}
+
+.processing-stage-description {
+  color: #374151;
+}
+
+.processing-stage-note {
+  color: #92400e;
+}
+
 .status-extracting {
   color: #f59e0b;
 }
@@ -483,6 +498,14 @@
 
   .progress-bar {
     background: #374151;
+  }
+
+  .processing-stage-description {
+    color: #d1d5db;
+  }
+
+  .processing-stage-note {
+    color: #fbbf24;
   }
 
   .info-box {

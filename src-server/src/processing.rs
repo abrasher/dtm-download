@@ -70,15 +70,25 @@ pub async fn merge_to_cog(
         .await
         .map(|p| format!("PREDICTOR={}", p));
     let temp_path = format!("{}.temp.tif", output_path.trim_end_matches(".tif"));
+
+    sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
+        stage: "preparing_inputs".to_string(),
+        percentage: 5,
+        message: format!(
+            "Preparing {} raster(s) for processing...",
+            input_files.len()
+        ),
+    }));
+
     let warp_stage = if clip_extent.is_some() {
         "clipping"
     } else {
         "merging"
     };
     let warp_message = if clip_extent.is_some() {
-        "Cropping rasters..."
+        "Clipping selected area..."
     } else {
-        "Merging rasters..."
+        "Merging source rasters..."
     };
 
     let mut warp_cmd = Command::new("gdalwarp");
@@ -112,7 +122,7 @@ pub async fn merge_to_cog(
         warp_cmd.arg(file);
     }
     warp_cmd.arg(&temp_path);
-    run_gdal_command_with_progress(warp_cmd, warp_stage, 0, 75, warp_message, sender).await?;
+    run_gdal_command_with_progress(warp_cmd, warp_stage, 10, 74, warp_message, sender).await?;
 
     let mut translate_cmd = Command::new("gdal_translate");
     translate_cmd
@@ -136,11 +146,17 @@ pub async fn merge_to_cog(
         translate_cmd,
         "creating_cog",
         75,
-        99,
+        97,
         "Creating Cloud Optimized GeoTIFF...",
         sender,
     )
     .await?;
+
+    sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
+        stage: "finalizing".to_string(),
+        percentage: 99,
+        message: "Finalizing output and preparing download...".to_string(),
+    }));
 
     let _ = std::fs::remove_file(&temp_path);
 

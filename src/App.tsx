@@ -8,6 +8,14 @@ import {
   getFallbackProjectOptionKey,
   resolvePackagesForCoverageMode,
 } from './utils/projectSelection';
+import {
+  buildDownloadProgressMap,
+  getProcessingStageDescription,
+  shouldTriggerAutoDownload,
+  type DownloadProgress,
+  type JobStatusResponse,
+  type ProcessingProgress,
+} from './utils/downloadPolling';
 import './App.css';
 
 const API_BASE = '/api';
@@ -24,29 +32,6 @@ interface Package {
     type: string;
     coordinates: number[][][];
   };
-}
-
-interface DownloadProgress {
-  package_name: string;
-  bytes_downloaded: number;
-  total_bytes: number;
-  percentage: number;
-  speed_bps: number;
-  eta_seconds: number | null;
-  status: string;
-}
-
-interface ProcessingProgress {
-  stage: string;
-  percentage: number;
-  message: string;
-}
-
-interface ProgressEvent {
-  Download?: DownloadProgress;
-  Processing?: ProcessingProgress;
-  Complete?: { output_filename: string };
-  Error?: { message: string };
 }
 
 type AppStep = 'extent' | 'packages' | 'download' | 'processing' | 'complete';
@@ -89,11 +74,15 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [downloadId, setDownloadId] = useState<string | null>(null);
+  const [outputFilename, setOutputFilename] = useState<string | null>(null);
+  const [autoDownloadState, setAutoDownloadState] = useState<'idle' | 'succeeded' | 'failed'>('idle');
+  const [downloadActionError, setDownloadActionError] = useState<string | null>(null);
 
   const mapRef = useRef<L.Map | null>(null);
   const rectangleRef = useRef<L.Rectangle | null>(null);
   const footprintsRef = useRef<L.GeoJSON | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const autoDownloadAttemptRef = useRef<string | null>(null);
 
   const wgs84ToWebMercator = (lon: number, lat: number): [number, number] => {
     const x = lon * 20037508.34 / 180;
@@ -279,49 +268,15 @@ function App() {
     }
   };
 
-  useEffect(() => {
-    if (!downloadId) return;
+  const downloadFile = async (id: string, filename: string, automatic = false) => {
+    setDownloadActionError(null);
 
-    const eventSource = new EventSource(`${API_BASE}/download/${downloadId}/progress`);
-    
-    eventSource.onmessage = (event) => {
-      if (!event.data.startsWith('{')) return;
-      try {
-        const progress: ProgressEvent = JSON.parse(event.data);
-        
-        if (progress.Download) {
-          setDownloadProgress(prev => {
-            const next = new Map(prev);
-            next.set(progress.Download!.package_name, progress.Download!);
-            return next;
-          });
-        } else if (progress.Processing) {
-          setProcessingProgress(progress.Processing);
-          setStep('processing');
-        } else if (progress.Complete) {
-          setStep('complete');
-          eventSource.close();
-          downloadFile(downloadId, progress.Complete.output_filename);
-        } else if (progress.Error) {
-          setError(progress.Error.message);
-          setStep('packages');
-          eventSource.close();
-        }
-      } catch (e) {
-        console.error('Failed to parse progress event', e);
-      }
-    };
-
-    eventSource.onerror = () => {
-      console.error('SSE error');
-    };
-
-    return () => eventSource.close();
-  }, [downloadId]);
-
-  const downloadFile = async (id: string, filename: string) => {
     try {
       const response = await fetch(`${API_BASE}/download/${id}/file`);
+      if (!response.ok) {
+        throw new Error(`Server error: ${response.status}`);
+      }
+
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -331,10 +286,96 @@ function App() {
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
+      setAutoDownloadState('succeeded');
     } catch (err) {
-      setError(`Failed to download file: ${err}`);
+      const message = `Failed to download file: ${err}`;
+      setDownloadActionError(message);
+
+      if (automatic) {
+        setAutoDownloadState('failed');
+        return;
+      }
+
+      setError(message);
     }
   };
+
+  useEffect(() => {
+    if (!downloadId) return;
+
+    let cancelled = false;
+    let polling = false;
+    let intervalId: number | null = null;
+
+    const pollStatus = async () => {
+      if (cancelled || polling) return;
+      polling = true;
+
+      try {
+        const response = await fetch(`${API_BASE}/download/${downloadId}/progress`, {
+          cache: 'no-store',
+        });
+
+        if (!response.ok) {
+          throw new Error(`Server error: ${response.status}`);
+        }
+
+        const status: JobStatusResponse = await response.json();
+        if (cancelled) return;
+
+        setDownloadProgress(buildDownloadProgressMap(status.download_progress));
+        setProcessingProgress(status.processing_progress);
+        setOutputFilename(status.output_filename);
+
+        if (status.status === 'error' && status.error) {
+          setError(status.error);
+          setStep('packages');
+          setDownloadId(null);
+          if (intervalId !== null) {
+            window.clearInterval(intervalId);
+          }
+          return;
+        }
+
+        if (status.status === 'complete') {
+          setStep('complete');
+          if (intervalId !== null) {
+            window.clearInterval(intervalId);
+          }
+
+          if (shouldTriggerAutoDownload(status, downloadId, autoDownloadAttemptRef.current)) {
+            autoDownloadAttemptRef.current = downloadId;
+            void downloadFile(downloadId, status.output_filename!, true);
+          }
+
+          return;
+        }
+
+        if (status.processing_progress) {
+          setStep('processing');
+          return;
+        }
+
+        setStep('download');
+      } catch (err) {
+        if (!cancelled) {
+          console.error('Failed to poll job progress', err);
+        }
+      } finally {
+        polling = false;
+      }
+    };
+
+    void pollStatus();
+    intervalId = window.setInterval(() => {
+      void pollStatus();
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [downloadId]);
 
   const handleStartDownload = async () => {
     if (!selectedProjectKey) {
@@ -349,6 +390,12 @@ function App() {
 
     setStep('download');
     setError(null);
+    setDownloadActionError(null);
+    setAutoDownloadState('idle');
+    setOutputFilename(null);
+    setDownloadProgress(new Map());
+    setProcessingProgress(null);
+    autoDownloadAttemptRef.current = null;
 
     let clip_extent = null;
     if (extent) {
@@ -358,7 +405,7 @@ function App() {
     }
 
     try {
-      const result = await fetch(`${API_BASE}/download/start`, {
+      const response = await fetch(`${API_BASE}/download/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -366,7 +413,14 @@ function App() {
           clip_extent,
           compression,
         }),
-      }).then(r => r.json());
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Server error: ${response.status} - ${errorText}`);
+      }
+
+      const result = await response.json();
 
       setDownloadId(result.download_id);
     } catch (err) {
@@ -414,7 +468,11 @@ function App() {
     setDownloadProgress(new Map());
     setProcessingProgress(null);
     setDownloadId(null);
+    setOutputFilename(null);
+    setAutoDownloadState('idle');
+    setDownloadActionError(null);
     setError(null);
+    autoDownloadAttemptRef.current = null;
     if (rectangleRef.current && mapRef.current) {
       mapRef.current.removeLayer(rectangleRef.current);
       rectangleRef.current = null;
@@ -424,6 +482,25 @@ function App() {
       footprintsRef.current = null;
     }
     mapRef.current?.setView([45.0, -79.0], 6);
+  };
+
+  const formatProcessingStageLabel = (stage: string | null): string => {
+    switch (stage) {
+      case 'preparing_inputs':
+        return 'Preparing Inputs';
+      case 'clipping':
+        return 'Clipping Area';
+      case 'merging':
+        return 'Merging Tiles';
+      case 'creating_cog':
+        return 'Building COG';
+      case 'finalizing':
+        return 'Finalizing Output';
+      case 'completed':
+        return 'Complete';
+      default:
+        return 'Processing';
+    }
   };
 
   return (
@@ -625,13 +702,20 @@ function App() {
         {step === 'processing' && (
           <div className="control-panel">
             <h2>Step 4: Processing</h2>
-            <p>Creating Cloud Optimized GeoTIFF...</p>
+            <p>Large clips can take several minutes. The progress display below will update as each server-side phase completes.</p>
             {processingProgress && (
               <div className="processing-progress">
-                <div className="progress-label">{processingProgress.stage}: {processingProgress.message}</div>
+                <div className="progress-label">{formatProcessingStageLabel(processingProgress.stage)}: {processingProgress.percentage}%</div>
                 <div className="progress-bar">
                   <div className="progress-fill" style={{ width: `${processingProgress.percentage}%` }} />
                 </div>
+                <div className="progress-details">
+                  <span>{processingProgress.message}</span>
+                </div>
+                <p className="processing-stage-description">{getProcessingStageDescription(processingProgress)}</p>
+                {processingProgress.percentage >= 100 && processingProgress.stage !== 'completed' && (
+                  <p className="processing-stage-note">This phase has finished. Large jobs can take a short time before the next phase starts reporting.</p>
+                )}
               </div>
             )}
           </div>
@@ -640,16 +724,28 @@ function App() {
         {step === 'complete' && (
           <div className="control-panel">
             <h2>Complete!</h2>
-            <p>Your DTM is ready and has been downloaded.</p>
+            <p>Your DTM is ready. If the automatic download did not start, use the button below.</p>
             <div className="info-box">
               <ul>
                 <li>Format: Cloud Optimized GeoTIFF</li>
                 <li>Compression: {compression.toUpperCase()}</li>
                 <li>Resolution: 0.5m</li>
                 <li>Vertical Datum: CGVD2013</li>
+                {outputFilename && <li>File: {outputFilename}</li>}
               </ul>
             </div>
-            <button className="primary-button" onClick={resetApp}>Start New Download</button>
+            {autoDownloadState === 'failed' && (
+              <p className="processing-stage-note">Automatic download did not complete. Start it manually below.</p>
+            )}
+            {downloadActionError && <div className="error">{downloadActionError}</div>}
+            <div className="button-group">
+              {downloadId && outputFilename && (
+                <button className="primary-button" onClick={() => void downloadFile(downloadId, outputFilename)}>
+                  Download File
+                </button>
+              )}
+              <button className="secondary-button" onClick={resetApp}>Start New Download</button>
+            </div>
           </div>
         )}
       </div>

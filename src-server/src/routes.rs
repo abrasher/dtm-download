@@ -1,19 +1,18 @@
 use axum::{
     extract::{Path, State},
-    response::{sse::Event, IntoResponse, Sse},
+    response::IntoResponse,
     Json,
 };
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
-use futures::stream::Stream;
 use tokio::sync::{broadcast, RwLock};
 
 use crate::api_types::{
-    DownloadRequest, DownloadStartResponse, Package, ProgressEvent, QueryRequest, QueryResult,
+    DownloadJobState, DownloadRequest, DownloadStartResponse, DownloadStatusResponse, Package,
+    ProgressEvent, QueryRequest, QueryResult,
 };
 use crate::download::{extract_zip, DownloadManager, ProgressSender};
 use crate::package_client::PackageClient;
@@ -22,11 +21,11 @@ use crate::processing::{merge_to_cog, ClipExtent, CompressionType};
 pub struct DownloadJob {
     pub output_path: String,
     pub filename: String,
-    pub sender: broadcast::Sender<ProgressEvent>,
+    pub status: DownloadStatusResponse,
 }
 
 pub struct AppState {
-    pub downloads: HashMap<String, Arc<RwLock<Option<DownloadJob>>>>,
+    pub downloads: HashMap<String, Arc<RwLock<DownloadJob>>>,
 }
 
 impl AppState {
@@ -94,10 +93,10 @@ pub async fn start_download(
     let job = DownloadJob {
         output_path: output_path.clone(),
         filename: output_filename.clone(),
-        sender: tx.clone(),
+        status: DownloadStatusResponse::default(),
     };
 
-    let job_state: Arc<RwLock<Option<DownloadJob>>> = Arc::new(RwLock::new(Some(job)));
+    let job_state = Arc::new(RwLock::new(job));
 
     {
         let mut state = state.write().await;
@@ -105,6 +104,8 @@ pub async fn start_download(
             .downloads
             .insert(download_id.clone(), job_state.clone());
     }
+
+    tokio::spawn(track_job_progress(job_state.clone(), tx.subscribe()));
 
     let packages = req.packages.clone();
     let clip_extent = req.clip_extent.clone();
@@ -282,41 +283,74 @@ fn package_cache_key(pkg: &Package) -> String {
 pub async fn download_progress(
     Path(id): Path<String>,
     State(state): State<Arc<RwLock<AppState>>>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, String> {
-    let sender = {
+) -> Result<Json<DownloadStatusResponse>, String> {
+    let mut status = {
         let state = state.read().await;
         let job_state = state
             .downloads
             .get(&id)
             .ok_or_else(|| "Download not found".to_string())?;
         let job = job_state.read().await;
-        job.as_ref()
-            .map(|j| j.sender.clone())
-            .ok_or_else(|| "Job not found".to_string())?
-    };
-
-    let mut rx = sender.subscribe();
-
-    let stream = async_stream::stream! {
-        while let Some(event) = recv_progress_event(&mut rx).await {
-            let json = serde_json::to_string(&event).unwrap_or_default();
-            yield Ok(Event::default().data(json));
+        let mut status = job.status.clone();
+        status.file_ready = FsPath::new(&job.output_path).exists();
+        if status.file_ready && status.output_filename.is_none() {
+            status.output_filename = Some(job.filename.clone());
         }
+        status
     };
 
-    Ok(Sse::new(stream).keep_alive(
-        axum::response::sse::KeepAlive::new()
-            .interval(std::time::Duration::from_secs(15))
-            .text("ping"),
-    ))
+    if status.file_ready && status.status == DownloadJobState::Running && status.error.is_none() {
+        status.status = DownloadJobState::Complete;
+    }
+
+    Ok(Json(status))
 }
 
-async fn recv_progress_event(rx: &mut broadcast::Receiver<ProgressEvent>) -> Option<ProgressEvent> {
+async fn track_job_progress(
+    job_state: Arc<RwLock<DownloadJob>>,
+    mut rx: broadcast::Receiver<ProgressEvent>,
+) {
     loop {
         match rx.recv().await {
-            Ok(event) => return Some(event),
+            Ok(event) => {
+                let mut job = job_state.write().await;
+                apply_progress_event(&mut job.status, event);
+                job.status.file_ready = FsPath::new(&job.output_path).exists();
+            }
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => return None,
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+fn apply_progress_event(status: &mut DownloadStatusResponse, event: ProgressEvent) {
+    match event {
+        ProgressEvent::Download(progress) => {
+            match status
+                .download_progress
+                .iter_mut()
+                .find(|existing| existing.package_name == progress.package_name)
+            {
+                Some(existing) => *existing = progress,
+                None => status.download_progress.push(progress),
+            }
+            status
+                .download_progress
+                .sort_by(|left, right| left.package_name.cmp(&right.package_name));
+        }
+        ProgressEvent::Processing(progress) => {
+            status.processing_progress = Some(progress);
+        }
+        ProgressEvent::Complete { output_filename } => {
+            status.output_filename = Some(output_filename);
+            status.status = DownloadJobState::Complete;
+            status.error = None;
+            status.file_ready = true;
+        }
+        ProgressEvent::Error { message } => {
+            status.error = Some(message);
+            status.status = DownloadJobState::Error;
+            status.file_ready = false;
         }
     }
 }
@@ -336,8 +370,7 @@ pub async fn download_file(
 
     let (output_path, filename) = {
         let job = job_state.read().await;
-        let j = job.as_ref().ok_or_else(|| "Job not found".to_string())?;
-        (j.output_path.clone(), j.filename.clone())
+        (job.output_path.clone(), job.filename.clone())
     };
 
     let file = tokio::fs::File::open(&output_path)
@@ -358,7 +391,6 @@ pub async fn download_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::broadcast;
 
     fn test_package(package_name: &str, download_url: &str) -> Package {
         Package {
@@ -403,40 +435,57 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_recv_progress_event_skips_lagged_messages() {
-        let (tx, mut rx) = broadcast::channel(1);
+    #[test]
+    fn test_apply_progress_event_updates_download_snapshot() {
+        let mut status = DownloadStatusResponse::default();
 
-        tx.send(ProgressEvent::Download(
-            crate::api_types::DownloadProgressEvent {
-                package_name: "first".to_string(),
-                bytes_downloaded: 1,
+        apply_progress_event(
+            &mut status,
+            ProgressEvent::Download(crate::api_types::DownloadProgressEvent {
+                package_name: "alpha".to_string(),
+                bytes_downloaded: 5,
                 total_bytes: 10,
-                percentage: 10.0,
-                speed_bps: 0.0,
-                eta_seconds: None,
+                percentage: 50.0,
+                speed_bps: 1.0,
+                eta_seconds: Some(5),
                 status: "downloading".to_string(),
-            },
-        ))
-        .unwrap();
-        tx.send(ProgressEvent::Complete {
-            output_filename: "latest.tif".to_string(),
-        })
-        .unwrap();
+            }),
+        );
 
-        let event = recv_progress_event(&mut rx).await;
-        assert!(matches!(
-            event,
-            Some(ProgressEvent::Complete { output_filename }) if output_filename == "latest.tif"
-        ));
+        assert_eq!(status.download_progress.len(), 1);
+        assert_eq!(status.download_progress[0].package_name, "alpha");
+        assert_eq!(status.status, DownloadJobState::Running);
     }
 
-    #[tokio::test]
-    async fn test_recv_progress_event_returns_none_when_channel_closed() {
-        let (tx, mut rx) = broadcast::channel(1);
-        drop(tx);
+    #[test]
+    fn test_apply_progress_event_transitions_to_complete() {
+        let mut status = DownloadStatusResponse::default();
 
-        let event = recv_progress_event(&mut rx).await;
-        assert!(event.is_none());
+        apply_progress_event(
+            &mut status,
+            ProgressEvent::Complete {
+                output_filename: "result.tif".to_string(),
+            },
+        );
+
+        assert_eq!(status.status, DownloadJobState::Complete);
+        assert_eq!(status.output_filename.as_deref(), Some("result.tif"));
+        assert!(status.file_ready);
+    }
+
+    #[test]
+    fn test_apply_progress_event_transitions_to_error() {
+        let mut status = DownloadStatusResponse::default();
+
+        apply_progress_event(
+            &mut status,
+            ProgressEvent::Error {
+                message: "boom".to_string(),
+            },
+        );
+
+        assert_eq!(status.status, DownloadJobState::Error);
+        assert_eq!(status.error.as_deref(), Some("boom"));
+        assert!(!status.file_ready);
     }
 }

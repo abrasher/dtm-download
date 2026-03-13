@@ -165,7 +165,7 @@ pub struct DownloadStartResponse {
     pub download_id: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DownloadProgressEvent {
     pub package_name: String,
     pub bytes_downloaded: u64,
@@ -176,19 +176,50 @@ pub struct DownloadProgressEvent {
     pub status: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProcessingProgressEvent {
     pub stage: String,
     pub percentage: u8,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ProgressEvent {
     Download(DownloadProgressEvent),
     Processing(ProcessingProgressEvent),
     Complete { output_filename: String },
     Error { message: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadJobState {
+    Running,
+    Complete,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DownloadStatusResponse {
+    pub download_progress: Vec<DownloadProgressEvent>,
+    pub processing_progress: Option<ProcessingProgressEvent>,
+    pub output_filename: Option<String>,
+    pub error: Option<String>,
+    pub status: DownloadJobState,
+    pub file_ready: bool,
+}
+
+impl Default for DownloadStatusResponse {
+    fn default() -> Self {
+        Self {
+            download_progress: Vec::new(),
+            processing_progress: None,
+            output_filename: None,
+            error: None,
+            status: DownloadJobState::Running,
+            file_ready: false,
+        }
+    }
 }
 
 // ============================================================
