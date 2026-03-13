@@ -50,10 +50,28 @@ export function getProcessingStageDescription(progress: ProcessingProgress | nul
     case 'preparing_inputs':
       return 'Preparing source rasters before clipping and packaging.';
     case 'clipping':
+      if (progress.message.includes('gdalwarp finished')) {
+        return 'Clipping is complete. The server is handing the intermediate raster off to Cloud Optimized GeoTIFF creation.';
+      }
+      if (progress.message.includes('Starting gdalwarp')) {
+        return 'Starting the crop operation and creating the intermediate raster for your selected area.';
+      }
       return 'Cropping the merged terrain model to your selected area.';
     case 'merging':
+      if (progress.message.includes('gdalwarp finished')) {
+        return 'Merging is complete. The intermediate raster is ready for Cloud Optimized GeoTIFF creation.';
+      }
+      if (progress.message.includes('Starting gdalwarp')) {
+        return 'Starting the merge operation across the selected source rasters.';
+      }
       return 'Combining source rasters into one output.';
     case 'creating_cog':
+      if (progress.message.includes('gdal_translate finished')) {
+        return 'Cloud Optimized GeoTIFF creation is complete. Final output cleanup is starting now.';
+      }
+      if (progress.message.includes('Starting gdal_translate')) {
+        return 'Starting Cloud Optimized GeoTIFF creation from the intermediate raster.';
+      }
       return 'Building the Cloud Optimized GeoTIFF structure and overviews.';
     case 'finalizing':
       return 'Final checks and preparing your file for download.';

@@ -713,7 +713,10 @@ function App() {
                   <span>{processingProgress.message}</span>
                 </div>
                 <p className="processing-stage-description">{getProcessingStageDescription(processingProgress)}</p>
-                {processingProgress.percentage >= 100 && processingProgress.stage !== 'completed' && (
+                {processingProgress.message.includes('finished') && processingProgress.stage !== 'completed' && (
+                  <p className="processing-stage-note">The previous GDAL command has finished. The next processing phase should begin reporting shortly.</p>
+                )}
+                {processingProgress.percentage >= 100 && processingProgress.stage !== 'completed' && !processingProgress.message.includes('finished') && (
                   <p className="processing-stage-note">This phase has finished. Large jobs can take a short time before the next phase starts reporting.</p>
                 )}
               </div>

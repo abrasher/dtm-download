@@ -122,7 +122,17 @@ pub async fn merge_to_cog(
         warp_cmd.arg(file);
     }
     warp_cmd.arg(&temp_path);
-    run_gdal_command_with_progress(warp_cmd, warp_stage, 10, 74, warp_message, sender).await?;
+    run_gdal_command_with_progress(
+        warp_cmd,
+        "gdalwarp",
+        warp_stage,
+        10,
+        74,
+        warp_message,
+        "gdalwarp finished. Preparing intermediate raster for Cloud Optimized GeoTIFF creation...",
+        sender,
+    )
+    .await?;
 
     let mut translate_cmd = Command::new("gdal_translate");
     translate_cmd
@@ -144,10 +154,12 @@ pub async fn merge_to_cog(
         .arg("NUM_THREADS=ALL_CPUS");
     run_gdal_command_with_progress(
         translate_cmd,
+        "gdal_translate",
         "creating_cog",
         75,
         97,
         "Creating Cloud Optimized GeoTIFF...",
+        "gdal_translate finished. Finalizing Cloud Optimized GeoTIFF output...",
         sender,
     )
     .await?;
@@ -171,16 +183,22 @@ pub async fn merge_to_cog(
 
 async fn run_gdal_command_with_progress(
     mut command: Command,
+    command_name: &str,
     stage: &str,
     start_percentage: u8,
     end_percentage: u8,
     message: &str,
+    completion_message: &str,
     sender: &ProgressSender,
 ) -> Result<(), ProcessingError> {
+    println!(
+        "[processing] starting {} for stage '{}' ({})",
+        command_name, stage, message
+    );
     sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
         stage: stage.to_string(),
         percentage: start_percentage,
-        message: message.to_string(),
+        message: build_command_start_message(command_name, message),
     }));
 
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -230,7 +248,7 @@ async fn run_gdal_command_with_progress(
     });
 
     let status = child.wait().await?;
-    let (stdout_output, last_progress) = stdout_task
+    let (stdout_output, _last_progress) = stdout_task
         .await
         .map_err(|e| ProcessingError::GdalError(e.to_string()))??;
     let stderr_output = stderr_task
@@ -250,15 +268,19 @@ async fn run_gdal_command_with_progress(
         return Err(ProcessingError::GdalError(details));
     }
 
-    if last_progress < 100 {
-        sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
-            stage: stage.to_string(),
-            percentage: end_percentage,
-            message: message.to_string(),
-        }));
-    }
+    println!("[processing] {} finished for stage '{}'", command_name, stage);
+
+    sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
+        stage: stage.to_string(),
+        percentage: end_percentage,
+        message: completion_message.to_string(),
+    }));
 
     Ok(())
+}
+
+fn build_command_start_message(command_name: &str, message: &str) -> String {
+    format!("Starting {}. {}", command_name, message)
 }
 
 fn scale_progress(progress: u8, start_percentage: u8, end_percentage: u8) -> u8 {
@@ -414,6 +436,14 @@ mod tests {
         assert_eq!(scale_progress(0, 10, 90), 10);
         assert_eq!(scale_progress(50, 10, 90), 50);
         assert_eq!(scale_progress(100, 10, 90), 90);
+    }
+
+    #[test]
+    fn test_build_command_start_message() {
+        assert_eq!(
+            build_command_start_message("gdalwarp", "Clipping selected area..."),
+            "Starting gdalwarp. Clipping selected area..."
+        );
     }
 
     #[test]

@@ -56,4 +56,14 @@ describe('downloadPolling', () => {
       }),
     ).toContain('Cloud Optimized GeoTIFF');
   });
+
+  it('explains the handoff after gdalwarp finishes', () => {
+    expect(
+      getProcessingStageDescription({
+        stage: 'clipping',
+        percentage: 74,
+        message: 'gdalwarp finished. Preparing intermediate raster for Cloud Optimized GeoTIFF creation...',
+      }),
+    ).toContain('handing the intermediate raster off');
+  });
 });
