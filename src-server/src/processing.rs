@@ -67,12 +67,25 @@ struct RasterBounds {
     max_y: f64,
 }
 
+impl RasterBounds {
+    fn intersects(&self, other: RasterBounds) -> bool {
+        self.min_x <= other.max_x
+            && self.max_x >= other.min_x
+            && self.min_y <= other.max_y
+            && self.max_y >= other.min_y
+    }
+}
+
 impl ClipExtent {
-    fn intersects(&self, bounds: RasterBounds) -> bool {
-        self.min_x <= bounds.max_x
-            && self.max_x >= bounds.min_x
-            && self.min_y <= bounds.max_y
-            && self.max_y >= bounds.min_y
+    fn to_wgs84_bounds(self) -> RasterBounds {
+        let (min_lon, min_lat) = web_mercator_to_wgs84(self.min_x, self.min_y);
+        let (max_lon, max_lat) = web_mercator_to_wgs84(self.max_x, self.max_y);
+        RasterBounds {
+            min_x: min_lon.min(max_lon),
+            min_y: min_lat.min(max_lat),
+            max_x: min_lon.max(max_lon),
+            max_y: min_lat.max(max_lat),
+        }
     }
 }
 
@@ -241,6 +254,7 @@ async fn filter_input_files_by_extent(
     sender: &ProgressSender,
 ) -> Result<Vec<String>, ProcessingError> {
     let total = input_files.len();
+    let clip_bounds_wgs84 = clip_extent.to_wgs84_bounds();
     sender.send(ProgressEvent::Processing(ProcessingProgressEvent {
         stage: "preparing_inputs".to_string(),
         percentage: 5,
@@ -279,7 +293,7 @@ async fn filter_input_files_by_extent(
         }
     }
 
-    let selected_input_files = select_intersecting_input_files(candidates, clip_extent);
+    let selected_input_files = select_intersecting_input_files(candidates, clip_bounds_wgs84);
     println!(
         "[processing] input filter kept {} of {} raster(s) for the selected area",
         selected_input_files.len(),
@@ -304,12 +318,12 @@ async fn filter_input_files_by_extent(
 
 fn select_intersecting_input_files(
     mut candidates: Vec<(usize, String, RasterBounds)>,
-    clip_extent: ClipExtent,
+    clip_bounds: RasterBounds,
 ) -> Vec<String> {
     candidates.sort_by_key(|(index, _, _)| *index);
     candidates
         .into_iter()
-        .filter_map(|(_, path, bounds)| clip_extent.intersects(bounds).then_some(path))
+        .filter_map(|(_, path, bounds)| clip_bounds.intersects(bounds).then_some(path))
         .collect()
 }
 
@@ -662,6 +676,15 @@ fn format_byte_count(bytes: u64) -> String {
     }
 }
 
+fn web_mercator_to_wgs84(x: f64, y: f64) -> (f64, f64) {
+    let lon = x * 180.0 / 20_037_508.34;
+    let lat = (y * std::f64::consts::PI / 20_037_508.34)
+        .exp()
+        .atan()
+        .mul_add(360.0 / std::f64::consts::PI, -90.0);
+    (lon, lat)
+}
+
 async fn detect_predictor_option(input_file: Option<&str>) -> Option<u8> {
     let input_file = input_file?;
     let data_type = detect_raster_data_type(input_file).await.ok()?;
@@ -729,7 +752,46 @@ fn parse_band_data_type(gdalinfo_json: &str) -> Option<String> {
 
 fn parse_raster_bounds(gdalinfo_json: &str) -> Option<RasterBounds> {
     let value: Value = serde_json::from_str(gdalinfo_json).ok()?;
+    if let Some(bounds) = value.get("wgs84Extent").and_then(parse_geojson_bounds) {
+        return Some(bounds);
+    }
+
     let corners = value.get("cornerCoordinates")?;
+    bounds_from_corner_coordinates(corners)
+}
+
+fn parse_geojson_bounds(value: &Value) -> Option<RasterBounds> {
+    let coordinates = value.get("coordinates")?;
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    collect_geojson_coordinate_pairs(coordinates, &mut xs, &mut ys);
+    if xs.is_empty() || ys.is_empty() {
+        return None;
+    }
+
+    Some(RasterBounds {
+        min_x: xs.iter().copied().fold(f64::INFINITY, f64::min),
+        min_y: ys.iter().copied().fold(f64::INFINITY, f64::min),
+        max_x: xs.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        max_y: ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    })
+}
+
+fn collect_geojson_coordinate_pairs(value: &Value, xs: &mut Vec<f64>, ys: &mut Vec<f64>) {
+    if let Some((x, y)) = parse_coordinate_pair(value) {
+        xs.push(x);
+        ys.push(y);
+        return;
+    }
+
+    if let Some(items) = value.as_array() {
+        for item in items {
+            collect_geojson_coordinate_pairs(item, xs, ys);
+        }
+    }
+}
+
+fn bounds_from_corner_coordinates(corners: &Value) -> Option<RasterBounds> {
     let mut xs = Vec::with_capacity(4);
     let mut ys = Vec::with_capacity(4);
 
@@ -821,19 +883,19 @@ mod tests {
 
     #[test]
     fn test_clip_extent_intersects_raster_bounds() {
-        let clip_extent = ClipExtent {
+        let clip_bounds = RasterBounds {
             min_x: 100.0,
             min_y: 100.0,
             max_x: 200.0,
             max_y: 200.0,
         };
-        assert!(clip_extent.intersects(RasterBounds {
+        assert!(clip_bounds.intersects(RasterBounds {
             min_x: 150.0,
             min_y: 150.0,
             max_x: 250.0,
             max_y: 250.0,
         }));
-        assert!(!clip_extent.intersects(RasterBounds {
+        assert!(!clip_bounds.intersects(RasterBounds {
             min_x: 201.0,
             min_y: 201.0,
             max_x: 300.0,
@@ -876,7 +938,7 @@ mod tests {
                     },
                 ),
             ],
-            ClipExtent {
+            RasterBounds {
                 min_x: 50.0,
                 min_y: 50.0,
                 max_x: 150.0,
