@@ -16,6 +16,7 @@ import {
   type JobStatusResponse,
   type ProcessingProgress,
 } from './utils/downloadPolling';
+import { buildDownloadFileUrl, triggerBrowserDownload } from './utils/fileDownload';
 import './App.css';
 
 const API_BASE = '/api';
@@ -272,20 +273,7 @@ function App() {
     setDownloadActionError(null);
 
     try {
-      const response = await fetch(`${API_BASE}/download/${id}/file`);
-      if (!response.ok) {
-        throw new Error(`Server error: ${response.status}`);
-      }
-
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      triggerBrowserDownload(document, buildDownloadFileUrl(id), filename);
       setAutoDownloadState('succeeded');
     } catch (err) {
       const message = `Failed to download file: ${err}`;
