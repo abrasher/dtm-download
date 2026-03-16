@@ -16,6 +16,7 @@ import {
   type JobStatusResponse,
   type ProcessingProgress,
 } from './utils/downloadPolling';
+import { buildStartDownloadRequest, DEFAULT_COMPRESSION } from './utils/downloadRequest';
 import { buildDownloadFileUrl, triggerBrowserDownload } from './utils/fileDownload';
 import './App.css';
 
@@ -71,7 +72,6 @@ function App() {
   const [totalSizeGb, setTotalSizeGb] = useState(0);
   const [downloadProgress, setDownloadProgress] = useState<Map<string, DownloadProgress>>(new Map());
   const [processingProgress, setProcessingProgress] = useState<ProcessingProgress | null>(null);
-  const [compression, setCompression] = useState<string>('deflate');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [downloadId, setDownloadId] = useState<string | null>(null);
@@ -396,11 +396,7 @@ function App() {
       const response = await fetch(`${API_BASE}/download/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          packages: selectedPackages,
-          clip_extent,
-          compression,
-        }),
+        body: JSON.stringify(buildStartDownloadRequest(selectedPackages, clip_extent)),
       });
 
       if (!response.ok) {
@@ -637,16 +633,6 @@ function App() {
             <div className="package-summary">
               {selectedPackages.length} packages • {selectedPackages.reduce((s, p) => s + p.coverage_km2, 0).toFixed(0)} km² • {selectedPackages.reduce((s, p) => s + p.size_gb, 0).toFixed(2)} GB
             </div>
-
-            <div className="output-options">
-              <label>Compression:</label>
-              <select value={compression} onChange={(e) => setCompression(e.target.value)}>
-                <option value="deflate">Deflate</option>
-                <option value="zstd">ZSTD</option>
-                <option value="lzma">LZMA</option>
-              </select>
-            </div>
-
             <div className="button-group">
               <button className="secondary-button" onClick={() => setStep('extent')}>Back</button>
               <button className="primary-button" onClick={handleStartDownload}>Use Selected Data</button>
@@ -721,7 +707,7 @@ function App() {
             <div className="info-box">
               <ul>
                 <li>Format: Cloud Optimized GeoTIFF</li>
-                <li>Compression: {compression.toUpperCase()}</li>
+                <li>Compression: {DEFAULT_COMPRESSION.toUpperCase()}</li>
                 <li>Resolution: 0.5m</li>
                 <li>Vertical Datum: CGVD2013</li>
                 {outputFilename && <li>File: {outputFilename}</li>}

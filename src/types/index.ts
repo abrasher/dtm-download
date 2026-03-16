@@ -73,7 +73,7 @@ export interface ProcessingProgress {
 
 export interface OutputOptions {
   format: 'cog' | 'geotiff';
-  compression: 'zstd' | 'lzma' | 'deflate' | 'lzw';
+  compression: 'deflate';
   compressionLevel: number;
   tileSize: 256 | 512;
   outputPath: string;
