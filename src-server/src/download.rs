@@ -328,7 +328,7 @@ fn is_tiff_path(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| {
             let ext = ext.to_ascii_lowercase();
-            ext == "tif" || ext == "tiff"
+            ext == "tif" || ext == "tiff" || ext == "img"
         })
         .unwrap_or(false)
 }
@@ -569,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn test_check_extraction_complete_detects_uppercase_tiff_files() {
+    fn test_check_extraction_complete_detects_uppercase_raster_files() {
         let temp_dir = create_temp_dir("dtm-download-check-extract");
         let zip_path = temp_dir.join("package.zip");
         let output_dir = temp_dir.join("extract");
@@ -577,14 +577,14 @@ mod tests {
         write_zip_with_entries(
             &zip_path,
             &[
-                ("nested/TILE_001.TIF", b"fake-tiff-data"),
+                ("nested/TILE_001.IMG", b"fake-raster-data"),
                 ("nested/readme.txt", b"metadata"),
             ],
         );
 
-        let extracted_tiff = output_dir.join("nested").join("TILE_001.TIF");
-        std::fs::create_dir_all(extracted_tiff.parent().unwrap()).unwrap();
-        std::fs::write(&extracted_tiff, b"fake-tiff-data").unwrap();
+        let extracted_raster = output_dir.join("nested").join("TILE_001.IMG");
+        std::fs::create_dir_all(extracted_raster.parent().unwrap()).unwrap();
+        std::fs::write(&extracted_raster, b"fake-raster-data").unwrap();
         std::fs::write(output_dir.join("nested").join("readme.txt"), b"metadata").unwrap();
 
         let result =
@@ -593,23 +593,23 @@ mod tests {
 
         assert_eq!(
             result.tiff_files,
-            vec![extracted_tiff.to_string_lossy().to_string()]
+            vec![extracted_raster.to_string_lossy().to_string()]
         );
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[tokio::test]
-    async fn test_extract_zip_returns_uppercase_cached_tiffs() {
+    async fn test_extract_zip_returns_uppercase_cached_rasters() {
         let temp_dir = create_temp_dir("dtm-download-extract-zip");
         let zip_path = temp_dir.join("package.zip");
         let output_dir = temp_dir.join("extract");
 
-        write_zip_with_entries(&zip_path, &[("tile/DTM_CACHE.TIF", b"cached-data")]);
+        write_zip_with_entries(&zip_path, &[("tile/DTM_CACHE.IMG", b"cached-data")]);
 
-        let extracted_tiff = output_dir.join("tile").join("DTM_CACHE.TIF");
-        std::fs::create_dir_all(extracted_tiff.parent().unwrap()).unwrap();
-        std::fs::write(&extracted_tiff, b"cached-data").unwrap();
+        let extracted_raster = output_dir.join("tile").join("DTM_CACHE.IMG");
+        std::fs::create_dir_all(extracted_raster.parent().unwrap()).unwrap();
+        std::fs::write(&extracted_raster, b"cached-data").unwrap();
 
         let (tx, _) = broadcast::channel(8);
         let sender = ProgressSender::new(tx);
@@ -622,7 +622,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result, vec![extracted_tiff.to_string_lossy().to_string()]);
+        assert_eq!(result, vec![extracted_raster.to_string_lossy().to_string()]);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
