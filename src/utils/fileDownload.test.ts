@@ -51,4 +51,5 @@ describe('fileDownload', () => {
     expect(click).toHaveBeenCalledTimes(1);
     expect(removeChild).toHaveBeenCalledWith(anchor);
   });
+
 });

@@ -405,29 +405,42 @@ pub async fn download_qgis_style(
             .ok_or_else(|| "Download not found".to_string())?
     };
 
-    let filename = {
+    let (output_path, filename) = {
         let job = job_state.read().await;
         if !FsPath::new(&job.output_path).exists() {
             return Err("DTM file is not ready".to_string());
         }
-        job.filename.clone()
+        (job.output_path.clone(), job.filename.clone())
     };
     let style_filename = qgis_style_filename(&filename);
     let definition = build_qgis_layer_definition(&filename, &id);
+    let style_path = FsPath::new(&output_path).with_file_name(&style_filename);
+    tokio::fs::write(&style_path, definition)
+        .await
+        .map_err(|e| e.to_string())?;
+    let file = tokio::fs::File::open(&style_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    let content_length = file.metadata().await.map_err(|e| e.to_string())?.len();
+    let stream = tokio_util::io::ReaderStream::new(file);
 
     Ok(axum::response::Response::builder()
-        .header("Content-Type", "application/xml; charset=utf-8")
+        .header("Content-Type", "application/octet-stream")
+        .header("Content-Length", content_length)
+        .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff")
         .header(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", style_filename),
         )
-        .body(axum::body::Body::from(definition))
+        .body(axum::body::Body::from_stream(stream))
         .map_err(|e| e.to_string())?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
 
     fn test_package(package_name: &str, download_url: &str) -> Package {
         Package {
@@ -524,5 +537,48 @@ mod tests {
         assert_eq!(status.status, DownloadJobState::Error);
         assert_eq!(status.error.as_deref(), Some("boom"));
         assert!(!status.file_ready);
+    }
+
+    #[tokio::test]
+    async fn test_qgis_style_download_is_a_complete_binary_attachment() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let output_dir = std::env::temp_dir().join(&id);
+        let output_path = output_dir.join("dtm_output_test.tif");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(&output_path, []).unwrap();
+
+        let mut app_state = AppState::new();
+        app_state.downloads.insert(
+            id.clone(),
+            Arc::new(RwLock::new(DownloadJob {
+                output_path: output_path.to_string_lossy().to_string(),
+                filename: "dtm_output_test.tif".to_string(),
+                status: DownloadStatusResponse::default(),
+            })),
+        );
+
+        let response = download_qgis_style(Path(id), State(Arc::new(RwLock::new(app_state))))
+            .await
+            .unwrap()
+            .into_response();
+
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/octet-stream"
+        );
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(
+            response.headers()["content-disposition"],
+            "attachment; filename=\"dtm_output_test_terrain.qlr\""
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(body.ends_with(b"</qlr>\n"));
+        assert_eq!(
+            std::fs::read(output_dir.join("dtm_output_test_terrain.qlr")).unwrap(),
+            body
+        );
+
+        std::fs::remove_dir_all(output_dir).unwrap();
     }
 }

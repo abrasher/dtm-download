@@ -225,3 +225,4 @@ Run tests before marking work complete:
 - Coordinates are in Web Mercator (EPSG:3857)
 - GDAL is provided by the Docker runtime; host-only backend runs require a separate host GDAL installation
 - No comments in code unless explicitly requested
+- When handing off a running development or deployed instance, always provide and verify a URL using the host's reachable IP address (for example, `http://192.168.50.100:5173`). Do not provide only a `localhost` URL; `localhost` may be included as a secondary URL.
