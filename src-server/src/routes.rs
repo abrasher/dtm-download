@@ -15,6 +15,7 @@ use crate::api_types::{
     ProgressEvent, QueryRequest, QueryResult,
 };
 use crate::download::{extract_zip, DownloadManager, ProgressSender};
+use crate::location_search::LocationSearchService;
 use crate::package_client::PackageClient;
 use crate::processing::{merge_to_cog, ClipExtent, CompressionType};
 
@@ -26,12 +27,14 @@ pub struct DownloadJob {
 
 pub struct AppState {
     pub downloads: HashMap<String, Arc<RwLock<DownloadJob>>>,
+    pub location_search: Arc<LocationSearchService>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             downloads: HashMap::new(),
+            location_search: Arc::new(LocationSearchService::new()),
         }
     }
 }

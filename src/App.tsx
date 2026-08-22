@@ -18,6 +18,7 @@ import {
 } from './utils/downloadPolling';
 import { buildStartDownloadRequest, DEFAULT_COMPRESSION } from './utils/downloadRequest';
 import { buildDownloadFileUrl, triggerBrowserDownload } from './utils/fileDownload';
+import { searchOntarioLocations, type LocationSearchResult } from './utils/locationSearch';
 import './App.css';
 
 const API_BASE = '/api';
@@ -78,12 +79,18 @@ function App() {
   const [outputFilename, setOutputFilename] = useState<string | null>(null);
   const [autoDownloadState, setAutoDownloadState] = useState<'idle' | 'succeeded' | 'failed'>('idle');
   const [downloadActionError, setDownloadActionError] = useState<string | null>(null);
+  const [locationQuery, setLocationQuery] = useState('');
+  const [locationResults, setLocationResults] = useState<LocationSearchResult[]>([]);
+  const [locationSearchError, setLocationSearchError] = useState<string | null>(null);
+  const [locationSearchLoading, setLocationSearchLoading] = useState(false);
 
   const mapRef = useRef<L.Map | null>(null);
   const rectangleRef = useRef<L.Rectangle | null>(null);
   const footprintsRef = useRef<L.GeoJSON | null>(null);
+  const locationMarkerRef = useRef<L.CircleMarker | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const autoDownloadAttemptRef = useRef<string | null>(null);
+  const locationSearchAbortRef = useRef<AbortController | null>(null);
 
   const wgs84ToWebMercator = (lon: number, lat: number): [number, number] => {
     const x = lon * 20037508.34 / 180;
@@ -224,6 +231,64 @@ function App() {
       mapRef.current.fitBounds(bounds, { padding: [50, 50] });
     }
   }, [selectedPackages, extent]);
+
+  const focusLocation = (location: LocationSearchResult) => {
+    if (!mapRef.current) return;
+
+    if (locationMarkerRef.current) {
+      mapRef.current.removeLayer(locationMarkerRef.current);
+    }
+
+    locationMarkerRef.current = L.circleMarker([location.latitude, location.longitude], {
+      color: '#1d4ed8',
+      fillColor: '#3b82f6',
+      fillOpacity: 0.9,
+      interactive: false,
+      radius: 7,
+      weight: 3,
+    }).addTo(mapRef.current);
+
+    if (location.boundingBox) {
+      const [south, north, west, east] = location.boundingBox;
+      mapRef.current.fitBounds([[south, west], [north, east]], {
+        maxZoom: 15,
+        padding: [40, 40],
+      });
+    } else {
+      mapRef.current.setView([location.latitude, location.longitude], 13);
+    }
+  };
+
+  const handleLocationSearch = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!locationQuery.trim()) return;
+
+    locationSearchAbortRef.current?.abort();
+    const controller = new AbortController();
+    locationSearchAbortRef.current = controller;
+    setLocationSearchLoading(true);
+    setLocationSearchError(null);
+    setLocationResults([]);
+
+    try {
+      const results = await searchOntarioLocations(locationQuery, controller.signal);
+      setLocationResults(results);
+
+      if (results.length === 0) {
+        setLocationSearchError('No matching location found in Ontario. Try a nearby town or postal code.');
+        return;
+      }
+
+      focusLocation(results[0]);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      setLocationSearchError('Could not search for that location. Please try again.');
+    } finally {
+      if (locationSearchAbortRef.current === controller) {
+        setLocationSearchLoading(false);
+      }
+    }
+  };
 
   const handleSearchPackages = async () => {
     if (!extent) {
@@ -455,7 +520,12 @@ function App() {
     setOutputFilename(null);
     setAutoDownloadState('idle');
     setDownloadActionError(null);
+    setLocationQuery('');
+    setLocationResults([]);
+    setLocationSearchError(null);
     setError(null);
+    locationSearchAbortRef.current?.abort();
+    locationSearchAbortRef.current = null;
     autoDownloadAttemptRef.current = null;
     if (rectangleRef.current && mapRef.current) {
       mapRef.current.removeLayer(rectangleRef.current);
@@ -464,6 +534,10 @@ function App() {
     if (footprintsRef.current && mapRef.current) {
       mapRef.current.removeLayer(footprintsRef.current);
       footprintsRef.current = null;
+    }
+    if (locationMarkerRef.current && mapRef.current) {
+      mapRef.current.removeLayer(locationMarkerRef.current);
+      locationMarkerRef.current = null;
     }
     mapRef.current?.setView([45.0, -79.0], 6);
   };
@@ -525,6 +599,39 @@ function App() {
         {step === 'extent' && (
           <div className="control-panel">
             <h2>Step 1: Select Your Area</h2>
+            <form className="location-search" onSubmit={handleLocationSearch}>
+              <label htmlFor="location-search-input">Find a location in Ontario</label>
+              <div className="location-search-row">
+                <input
+                  id="location-search-input"
+                  type="search"
+                  value={locationQuery}
+                  onChange={(event) => setLocationQuery(event.target.value)}
+                  placeholder="Address, town, postal code, or landmark"
+                  autoComplete="street-address"
+                />
+                <button type="submit" disabled={!locationQuery.trim() || locationSearchLoading}>
+                  {locationSearchLoading ? 'Finding…' : 'Find'}
+                </button>
+              </div>
+            </form>
+
+            {locationSearchError && <p className="location-search-error">{locationSearchError}</p>}
+
+            {locationResults.length > 0 && (
+              <div className="location-results" aria-label="Location search results">
+                {locationResults.map((result) => (
+                  <button
+                    key={`${result.latitude}-${result.longitude}-${result.displayName}`}
+                    type="button"
+                    onClick={() => focusLocation(result)}
+                  >
+                    {result.displayName}
+                  </button>
+                ))}
+              </div>
+            )}
+
             <p className="hint">Hold <kbd>Shift</kbd> + Click and drag to draw a rectangle</p>
             
             {extent && (

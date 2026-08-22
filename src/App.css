@@ -132,6 +132,93 @@
   font-size: 0.85rem;
 }
 
+.location-search {
+  margin-bottom: 0.75rem;
+}
+
+.location-search label {
+  display: block;
+  color: #374151;
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+}
+
+.location-search-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.location-search-row input {
+  min-width: 0;
+  flex: 1;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  color: #111827;
+  background: white;
+  font: inherit;
+  font-size: 0.85rem;
+}
+
+.location-search-row input:focus {
+  border-color: #3b82f6;
+  outline: 2px solid #bfdbfe;
+  outline-offset: 1px;
+}
+
+.location-search-row button {
+  padding: 0.55rem 0.8rem;
+  border: none;
+  border-radius: 6px;
+  background: #2563eb;
+  color: white;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.location-search-row button:disabled {
+  background: #9ca3af;
+  cursor: not-allowed;
+}
+
+.location-results {
+  max-height: 150px;
+  overflow-y: auto;
+  border: 1px solid #dbeafe;
+  border-radius: 6px;
+  margin: -0.25rem 0 0.75rem;
+}
+
+.location-results button {
+  display: block;
+  width: 100%;
+  border: none;
+  border-bottom: 1px solid #e5e7eb;
+  padding: 0.55rem 0.65rem;
+  background: white;
+  color: #1f2937;
+  cursor: pointer;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  text-align: left;
+}
+
+.location-results button:last-child {
+  border-bottom: none;
+}
+
+.location-results button:hover,
+.location-results button:focus-visible {
+  background: #eff6ff;
+}
+
+.location-search-error {
+  color: #b91c1c;
+  font-size: 0.8rem;
+  margin: -0.25rem 0 0.75rem;
+}
+
 .extent-info {
   background: #eff6ff;
   border: 1px solid #bfdbfe;
@@ -441,6 +528,30 @@
 
   .control-panel h2 {
     color: #f3f4f6;
+  }
+
+  .location-search label {
+    color: #d1d5db;
+  }
+
+  .location-search-row input,
+  .location-results button {
+    background: #374151;
+    border-color: #4b5563;
+    color: #f3f4f6;
+  }
+
+  .location-results {
+    border-color: #4b5563;
+  }
+
+  .location-results button:hover,
+  .location-results button:focus-visible {
+    background: #4b5563;
+  }
+
+  .location-search-error {
+    color: #fca5a5;
   }
 
   .extent-info {
