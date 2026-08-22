@@ -1,5 +1,6 @@
 pub mod api_types;
 pub mod download;
+pub mod location_search;
 pub mod package_client;
 pub mod processing;
 pub mod routes;
@@ -25,6 +26,10 @@ fn create_router_with_frontend_dist(frontend_dist_dir: Option<PathBuf>) -> Route
 
     let router = Router::new()
         .route("/api/packages/query", post(routes::query_packages))
+        .route(
+            "/api/locations/search",
+            get(location_search::search_locations),
+        )
         .route("/api/download/start", post(routes::start_download))
         .route(
             "/api/download/{id}/progress",
@@ -87,6 +92,23 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body, "OK");
+    }
+
+    #[tokio::test]
+    async fn test_location_search_rejects_empty_query() {
+        let app = create_router_with_frontend_dist(None);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/locations/search?q=%20%20")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
