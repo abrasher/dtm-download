@@ -1,0 +1,15 @@
+services:
+  app:
+    build:
+      context: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${DTM_PORT:-0}:3000"
+    environment:
+      DTM_CACHE_DIR: /data/dtms
+      FRONTEND_DIST: /app/dist
+    volumes:
+      - type: bind
+        source: ${DTM_STORAGE_PATH}
+        target: /data/dtms

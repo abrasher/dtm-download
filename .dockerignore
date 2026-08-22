@@ -7,3 +7,5 @@ src-server/target
 docs
 *.log
 telemetry-id
+.env
+.env.*
