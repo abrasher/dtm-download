@@ -1,9 +1,13 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
+use rayon::prelude::*;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use zip::ZipArchive;
@@ -22,6 +26,8 @@ pub enum DownloadError {
     DirectoryError(String),
     #[error("Server does not support range requests")]
     RangeNotSupported,
+    #[error("Extraction task failed: {0}")]
+    ExtractionTask(String),
 }
 
 #[derive(Clone)]
@@ -425,6 +431,55 @@ pub async fn extract_zip(
     package_name: &str,
     sender: &ProgressSender,
 ) -> Result<Vec<String>, DownloadError> {
+    let zip_path = zip_path.to_string();
+    let output_dir = output_dir.to_string();
+    let package_name = package_name.to_string();
+    let sender = sender.clone();
+
+    tokio::task::spawn_blocking(move || {
+        extract_zip_blocking(&zip_path, &output_dir, &package_name, &sender)
+    })
+    .await
+    .map_err(|error| DownloadError::ExtractionTask(error.to_string()))?
+}
+
+#[derive(Debug)]
+struct ZipEntry {
+    index: usize,
+    outpath: PathBuf,
+    compressed_size: u64,
+    expected_size: u64,
+}
+
+fn extraction_worker_count(
+    entries: &[ZipEntry],
+    has_duplicate_paths: bool,
+    available_threads: usize,
+) -> usize {
+    let uncompressed_size = entries
+        .iter()
+        .map(|entry| entry.expected_size as u128)
+        .sum::<u128>();
+    let compressed_size = entries
+        .iter()
+        .map(|entry| entry.compressed_size as u128)
+        .sum::<u128>();
+    let is_mostly_uncompressed =
+        uncompressed_size == 0 || compressed_size * 100 >= uncompressed_size * 90;
+
+    if has_duplicate_paths || entries.len() < 2 || is_mostly_uncompressed {
+        1
+    } else {
+        available_threads.max(1).min(entries.len())
+    }
+}
+
+fn extract_zip_blocking(
+    zip_path: &str,
+    output_dir: &str,
+    package_name: &str,
+    sender: &ProgressSender,
+) -> Result<Vec<String>, DownloadError> {
     if let Some(extracted) = check_extraction_complete(zip_path, output_dir) {
         sender.send(ProgressEvent::Download(DownloadProgressEvent {
             package_name: package_name.to_string(),
@@ -443,9 +498,44 @@ pub async fn extract_zip(
     std::fs::create_dir_all(output_dir)
         .map_err(|e| DownloadError::DirectoryError(e.to_string()))?;
 
-    let mut extracted_files = Vec::new();
-    let total_files = archive.len();
-    let mut last_reported_percent = 0.0;
+    let mut entries = Vec::new();
+    let mut outpaths = HashSet::new();
+    let mut has_duplicate_paths = false;
+
+    for index in 0..archive.len() {
+        let file = archive
+            .by_index(index)
+            .map_err(|e| DownloadError::ZipError(e.to_string()))?;
+        let Some(relative_path) = file.enclosed_name() else {
+            continue;
+        };
+        let outpath = Path::new(output_dir).join(relative_path);
+
+        if file.name().ends_with('/') {
+            std::fs::create_dir_all(&outpath)
+                .map_err(|e| DownloadError::DirectoryError(e.to_string()))?;
+            continue;
+        }
+
+        if let Some(parent) = outpath.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| DownloadError::DirectoryError(e.to_string()))?;
+        }
+
+        if !outpaths.insert(outpath.clone()) {
+            has_duplicate_paths = true;
+        }
+        entries.push(ZipEntry {
+            index,
+            outpath,
+            compressed_size: file.compressed_size(),
+            expected_size: file.size(),
+        });
+    }
+
+    drop(archive);
+
+    let total_files = entries.len();
 
     sender.send(ProgressEvent::Download(DownloadProgressEvent {
         package_name: package_name.to_string(),
@@ -457,60 +547,66 @@ pub async fn extract_zip(
         status: "Extracting...".to_string(),
     }));
 
-    for i in 0..total_files {
-        {
-            let mut file = archive
-                .by_index(i)
-                .map_err(|e| DownloadError::ZipError(e.to_string()))?;
-            let outpath = match file.enclosed_name() {
-                Some(path) => Path::new(output_dir).join(path),
-                None => continue,
-            };
+    if total_files == 0 {
+        return collect_tiff_files(Path::new(output_dir)).map_err(DownloadError::from);
+    }
 
-            if file.name().ends_with('/') {
-                std::fs::create_dir_all(&outpath)
-                    .map_err(|e| DownloadError::DirectoryError(e.to_string()))?;
-            } else {
-                if let Some(p) = outpath.parent() {
-                    if !p.exists() {
-                        std::fs::create_dir_all(p)
-                            .map_err(|e| DownloadError::DirectoryError(e.to_string()))?;
-                    }
-                }
+    let worker_count =
+        extraction_worker_count(&entries, has_duplicate_paths, rayon::current_num_threads());
+    let chunk_size = total_files.div_ceil(worker_count);
+    let completed = AtomicUsize::new(0);
+    let last_reported_percent = Mutex::new(0);
 
-                let expected_size = file.size() as u64;
-                let needs_extraction = match std::fs::metadata(&outpath) {
-                    Ok(meta) => meta.len() != expected_size,
+    let extracted_chunks = entries
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            let file = File::open(zip_path)?;
+            let mut archive =
+                ZipArchive::new(file).map_err(|e| DownloadError::ZipError(e.to_string()))?;
+            let mut extracted_files = Vec::new();
+
+            for entry in chunk {
+                let needs_extraction = match std::fs::metadata(&entry.outpath) {
+                    Ok(metadata) => metadata.len() != entry.expected_size,
                     Err(_) => true,
                 };
 
                 if needs_extraction {
-                    let mut outfile = File::create(&outpath)?;
+                    let mut file = archive
+                        .by_index(entry.index)
+                        .map_err(|e| DownloadError::ZipError(e.to_string()))?;
+                    let mut outfile = File::create(&entry.outpath)?;
                     io::copy(&mut file, &mut outfile)?;
                 }
 
-                if is_tiff_path(&outpath) {
-                    extracted_files.push(outpath.to_string_lossy().to_string());
+                if is_tiff_path(&entry.outpath) {
+                    extracted_files.push(entry.outpath.to_string_lossy().to_string());
+                }
+
+                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                let percentage = count * 100 / total_files;
+                let mut previous = last_reported_percent
+                    .lock()
+                    .map_err(|error| DownloadError::ExtractionTask(error.to_string()))?;
+                if percentage >= *previous + 5 || count == total_files {
+                    sender.send(ProgressEvent::Download(DownloadProgressEvent {
+                        package_name: package_name.to_string(),
+                        bytes_downloaded: count as u64,
+                        total_bytes: total_files as u64,
+                        percentage: percentage as f64,
+                        speed_bps: 0.0,
+                        eta_seconds: None,
+                        status: "Extracting...".to_string(),
+                    }));
+                    *previous = percentage;
                 }
             }
-        }
 
-        let percentage = ((i + 1) as f64 / total_files as f64) * 100.0;
+            Ok::<Vec<String>, DownloadError>(extracted_files)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-        if percentage - last_reported_percent >= 5.0 || i == total_files - 1 {
-            sender.send(ProgressEvent::Download(DownloadProgressEvent {
-                package_name: package_name.to_string(),
-                bytes_downloaded: (i + 1) as u64,
-                total_bytes: total_files as u64,
-                percentage,
-                speed_bps: 0.0,
-                eta_seconds: None,
-                status: "Extracting...".to_string(),
-            }));
-            last_reported_percent = percentage;
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
+    let extracted_files = extracted_chunks.into_iter().flatten().collect();
 
     let extracted_files = normalize_tiff_files(extracted_files);
     if !extracted_files.is_empty() {
@@ -557,6 +653,15 @@ mod tests {
         writer.finish().unwrap();
     }
 
+    fn zip_entry(compressed_size: u64, expected_size: u64) -> ZipEntry {
+        ZipEntry {
+            index: 0,
+            outpath: PathBuf::from("tile.img"),
+            compressed_size,
+            expected_size,
+        }
+    }
+
     #[test]
     fn test_download_manager_creation() {
         let manager = DownloadManager::new();
@@ -566,6 +671,16 @@ mod tests {
     #[test]
     fn test_is_download_complete() {
         assert!(!DownloadManager::is_download_complete("/nonexistent"));
+    }
+
+    #[test]
+    fn test_extraction_worker_count_matches_compression_workload() {
+        let compressed_entries = vec![zip_entry(20, 100), zip_entry(25, 100)];
+        let stored_entries = vec![zip_entry(99, 100), zip_entry(98, 100)];
+
+        assert_eq!(extraction_worker_count(&compressed_entries, false, 12), 2);
+        assert_eq!(extraction_worker_count(&stored_entries, false, 12), 1);
+        assert_eq!(extraction_worker_count(&compressed_entries, true, 12), 1);
     }
 
     #[test]
@@ -623,6 +738,58 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, vec![extracted_raster.to_string_lossy().to_string()]);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_extracts_multiple_files_and_reports_completion() {
+        let temp_dir = create_temp_dir("dtm-download-parallel-extract");
+        let zip_path = temp_dir.join("package.zip");
+        let output_dir = temp_dir.join("extract");
+
+        write_zip_with_entries(
+            &zip_path,
+            &[
+                ("tiles/one.tif", b"first-raster"),
+                ("tiles/two.IMG", b"second-raster"),
+                ("metadata/readme.txt", b"metadata"),
+            ],
+        );
+
+        let (tx, mut receiver) = broadcast::channel(32);
+        let sender = ProgressSender::new(tx);
+        let result = extract_zip(
+            zip_path.to_str().unwrap(),
+            output_dir.to_str().unwrap(),
+            "Parallel package",
+            &sender,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            std::fs::read(output_dir.join("tiles/one.tif")).unwrap(),
+            b"first-raster"
+        );
+        assert_eq!(
+            std::fs::read(output_dir.join("tiles/two.IMG")).unwrap(),
+            b"second-raster"
+        );
+        assert_eq!(
+            std::fs::read(output_dir.join("metadata/readme.txt")).unwrap(),
+            b"metadata"
+        );
+
+        let mut percentages = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let ProgressEvent::Download(progress) = event {
+                percentages.push(progress.percentage);
+            }
+        }
+        assert!(percentages.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(percentages.last(), Some(&100.0));
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
