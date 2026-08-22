@@ -3,6 +3,7 @@ pub mod download;
 pub mod location_search;
 pub mod package_client;
 pub mod processing;
+pub mod qgis_style;
 pub mod routes;
 
 use axum::{
@@ -36,6 +37,10 @@ fn create_router_with_frontend_dist(frontend_dist_dir: Option<PathBuf>) -> Route
             get(routes::download_progress),
         )
         .route("/api/download/{id}/file", get(routes::download_file))
+        .route(
+            "/api/download/{id}/qgis-style",
+            get(routes::download_qgis_style),
+        )
         .route("/api/health", get(routes::health))
         .with_state(state)
         .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any));

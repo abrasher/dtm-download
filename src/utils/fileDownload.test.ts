@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { buildDownloadFileUrl, triggerBrowserDownload } from './fileDownload';
+import {
+  buildDownloadFileUrl,
+  buildQgisStyleFilename,
+  buildQgisStyleUrl,
+  triggerBrowserDownload,
+} from './fileDownload';
 
 describe('fileDownload', () => {
   it('builds a file endpoint URL for the download id', () => {
@@ -9,6 +14,13 @@ describe('fileDownload', () => {
 
   it('encodes reserved characters in the download id', () => {
     expect(buildDownloadFileUrl('job/123?x=1')).toBe('/api/download/job%2F123%3Fx%3D1/file');
+  });
+
+  it('builds a QGIS style endpoint URL and filename', () => {
+    expect(buildQgisStyleUrl('job/123')).toBe('/api/download/job%2F123/qgis-style');
+    expect(buildQgisStyleFilename('dtm_output_12345678.tif')).toBe(
+      'dtm_output_12345678_terrain.qlr',
+    );
   });
 
   it('triggers a browser-managed attachment download', () => {

@@ -358,6 +358,43 @@
   margin-bottom: 1rem;
 }
 
+.qgis-style-option {
+  display: flex;
+  gap: 0.65rem;
+  align-items: flex-start;
+  margin-bottom: 1rem;
+  padding: 0.75rem;
+  border: 1px solid #dbeafe;
+  border-radius: 8px;
+  background: #f8fafc;
+  cursor: pointer;
+}
+
+.qgis-style-option input {
+  margin-top: 0.2rem;
+}
+
+.qgis-style-option span,
+.qgis-style-option small {
+  display: block;
+}
+
+.qgis-style-option strong {
+  font-size: 0.85rem;
+  color: #1f2937;
+}
+
+.qgis-style-option small,
+.qgis-style-note {
+  color: #64748b;
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.qgis-style-note {
+  margin-top: 0.75rem;
+}
+
 .output-options {
   margin-bottom: 1rem;
 }
@@ -415,6 +452,7 @@
 
 .button-group {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.75rem;
 }
 

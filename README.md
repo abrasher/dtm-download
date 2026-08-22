@@ -86,16 +86,20 @@ http://localhost:3000
 
 ### Prerequisites
 
-- Node.js 20+
-- Rust 1.88+
-- GDAL
+- Docker
+- Node.js and npm for invoking the repository scripts
 
-### Run frontend + backend
+### Run the complete app
 
 ```bash
-npm install
-npm run dev:all
+npm run dev
 ```
+
+This builds the image and runs the application in the foreground at `http://localhost:5173`. Press `Ctrl+C` when finished. The runner traps normal exit, terminal closure, and interruption signals, stops the container, and uses `--rm` to remove it. The built image remains cached but does not continue running.
+
+Downloaded and extracted DTM data persists outside the worktree in `$HOME/.cache/dtm-download`. Set `DTM_CACHE_DIR` to use another host directory or `DTM_PORT` to change the default port `5173`.
+
+Host-only frontend and backend scripts are available as `npm run dev:frontend:host` and `npm run dev:server:host`, but complete raster processing through those commands requires GDAL to be installed separately on the host.
 
 ### Build locally
 

@@ -4,11 +4,15 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "npm run dev:docker",
+    "dev:docker": "npm run docker:build && bash scripts/run-docker-dev.sh",
+    "docker:build": "docker build --tag ontario-dtm-download:local .",
+    "dev:frontend:host": "vite",
+    "dev:server:host": "cd src-server && cargo run",
+    "dev:all:host": "concurrently \"npm run dev:frontend:host\" \"npm run dev:server:host\"",
+    "dev:all": "npm run dev:docker",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "dev:server": "cd src-server && cargo run",
-    "dev:all": "concurrently \"npm run dev\" \"npm run dev:server\"",
     "build:server": "cd src-server && cargo build --release"
   },
   "dependencies": {

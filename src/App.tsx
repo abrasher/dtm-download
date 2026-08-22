@@ -17,7 +17,12 @@ import {
   type ProcessingProgress,
 } from './utils/downloadPolling';
 import { buildStartDownloadRequest, DEFAULT_COMPRESSION } from './utils/downloadRequest';
-import { buildDownloadFileUrl, triggerBrowserDownload } from './utils/fileDownload';
+import {
+  buildDownloadFileUrl,
+  buildQgisStyleFilename,
+  buildQgisStyleUrl,
+  triggerBrowserDownload,
+} from './utils/fileDownload';
 import { searchOntarioLocations, type LocationSearchResult } from './utils/locationSearch';
 import './App.css';
 
@@ -83,6 +88,7 @@ function App() {
   const [locationResults, setLocationResults] = useState<LocationSearchResult[]>([]);
   const [locationSearchError, setLocationSearchError] = useState<string | null>(null);
   const [locationSearchLoading, setLocationSearchLoading] = useState(false);
+  const [includeQgisStyle, setIncludeQgisStyle] = useState(false);
 
   const mapRef = useRef<L.Map | null>(null);
   const rectangleRef = useRef<L.Rectangle | null>(null);
@@ -523,6 +529,7 @@ function App() {
     setLocationQuery('');
     setLocationResults([]);
     setLocationSearchError(null);
+    setIncludeQgisStyle(false);
     setError(null);
     locationSearchAbortRef.current?.abort();
     locationSearchAbortRef.current = null;
@@ -740,6 +747,17 @@ function App() {
             <div className="package-summary">
               {selectedPackages.length} packages • {selectedPackages.reduce((s, p) => s + p.coverage_km2, 0).toFixed(0)} km² • {selectedPackages.reduce((s, p) => s + p.size_gb, 0).toFixed(2)} GB
             </div>
+            <label className="qgis-style-option">
+              <input
+                type="checkbox"
+                checked={includeQgisStyle}
+                onChange={(event) => setIncludeQgisStyle(event.target.checked)}
+              />
+              <span>
+                <strong>Include QGIS terrain style</strong>
+                <small>Creates a portable .qlr with dynamic elevation colour over an on-the-fly hillshade.</small>
+              </span>
+            </label>
             <div className="button-group">
               <button className="secondary-button" onClick={() => setStep('extent')}>Back</button>
               <button className="primary-button" onClick={handleStartDownload}>Use Selected Data</button>
@@ -830,8 +848,23 @@ function App() {
                   Download File
                 </button>
               )}
+              {includeQgisStyle && downloadId && outputFilename && (
+                <button
+                  className="secondary-button"
+                  onClick={() => triggerBrowserDownload(
+                    document,
+                    buildQgisStyleUrl(downloadId),
+                    buildQgisStyleFilename(outputFilename),
+                  )}
+                >
+                  Download QGIS Style
+                </button>
+              )}
               <button className="secondary-button" onClick={resetApp}>Start New Download</button>
             </div>
+            {includeQgisStyle && (
+              <p className="qgis-style-note">Keep the .qlr beside the downloaded .tif, then add the .qlr to QGIS. Its colour range and hillshade redraw as the map canvas changes.</p>
+            )}
           </div>
         )}
       </div>

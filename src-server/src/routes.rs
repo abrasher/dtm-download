@@ -18,6 +18,7 @@ use crate::download::{extract_zip, DownloadManager, ProgressSender};
 use crate::location_search::LocationSearchService;
 use crate::package_client::PackageClient;
 use crate::processing::{merge_to_cog, ClipExtent, CompressionType};
+use crate::qgis_style::{build_qgis_layer_definition, qgis_style_filename};
 
 pub struct DownloadJob {
     pub output_path: String,
@@ -388,6 +389,39 @@ pub async fn download_file(
             format!("attachment; filename=\"{}\"", filename),
         )
         .body(axum::body::Body::from_stream(stream))
+        .map_err(|e| e.to_string())?)
+}
+
+pub async fn download_qgis_style(
+    Path(id): Path<String>,
+    State(state): State<Arc<RwLock<AppState>>>,
+) -> Result<impl IntoResponse, String> {
+    let job_state = {
+        let state = state.read().await;
+        state
+            .downloads
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| "Download not found".to_string())?
+    };
+
+    let filename = {
+        let job = job_state.read().await;
+        if !FsPath::new(&job.output_path).exists() {
+            return Err("DTM file is not ready".to_string());
+        }
+        job.filename.clone()
+    };
+    let style_filename = qgis_style_filename(&filename);
+    let definition = build_qgis_layer_definition(&filename, &id);
+
+    Ok(axum::response::Response::builder()
+        .header("Content-Type", "application/xml; charset=utf-8")
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", style_filename),
+        )
+        .body(axum::body::Body::from(definition))
         .map_err(|e| e.to_string())?)
 }
 
