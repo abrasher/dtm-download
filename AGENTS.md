@@ -9,10 +9,22 @@ Ontario DTM Downloader - Web application for downloading LiDAR-derived Digital T
 
 ## Build/Lint/Test Commands
 
+## Runtime Requirement
+
+Run the complete application through Docker. Raster processing shells out to GDAL programs that are installed by the runtime image and may not exist on the host. Do not use the host-only development commands to validate downloads or processing.
+
+```bash
+npm run dev
+```
+
+This builds the local image and runs it in the foreground at port `5173`. The runner traps normal exit, terminal closure, and interruption signals and stops the exact container it started. The container also uses `--rm`, so it is removed after stopping. The Docker image remains cached but is inert and does not keep running. Cached DTM data is stored outside the worktree at `$DTM_CACHE_DIR` or `$HOME/.cache/dtm-download` by default.
+
+Never add `--detach`, `-d`, or a Docker restart policy to the worktree development command. Before finishing work in a worktree, stop the foreground process with `Ctrl+C` and confirm that its container has exited.
+
 ### Frontend (TypeScript/React)
 
 ```bash
-npm run dev           # Start Vite dev server (localhost:5173)
+npm run dev:frontend:host # Start Vite only; no working raster processing
 npm run build         # Typecheck + build for production
 npm run preview       # Preview production build
 
@@ -27,7 +39,7 @@ npx vitest watch      # Watch mode
 ### Backend (Rust)
 
 ```bash
-cd src-server && cargo run              # Start backend server (localhost:3000)
+npm run dev:server:host                 # Start host backend; requires host GDAL
 cd src-server && cargo build            # Debug build
 cd src-server && cargo build --release  # Release build
 cd src-server && cargo check            # Fast type check (no codegen)
@@ -40,8 +52,10 @@ cd src-server && cargo fmt              # Format code
 ### Combined Development
 
 ```bash
-npm run dev:all        # Run frontend + backend concurrently
-npm run dev:server     # Backend only
+npm run dev            # Build and run the complete Docker app in foreground
+npm run dev:all        # Alias for npm run dev
+npm run docker:build   # Build the local runtime image without starting it
+npm run dev:all:host   # Host-only debugging; requires host GDAL
 npm run build:server   # Build backend release binary
 ```
 
@@ -207,6 +221,7 @@ Run tests before marking work complete:
 ## Notes
 
 - Vite proxy forwards `/api/*` to `localhost:3000` in development
+- The complete local app is exposed on port `5173` by the foreground Docker command
 - Coordinates are in Web Mercator (EPSG:3857)
-- GDAL must be installed for raster processing
+- GDAL is provided by the Docker runtime; host-only backend runs require a separate host GDAL installation
 - No comments in code unless explicitly requested
